@@ -12,22 +12,78 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+# Optional FLOP-counter backends (install one for GFLOPs support)
+try:
+    from fvcore.nn import FlopCountAnalysis
+    _FVCORE = True
+except ImportError:
+    _FVCORE = False
+
+try:
+    from thop import profile as thop_profile
+    _THOP = True
+except ImportError:
+    _THOP = False
+
 from swiftnet import swift_net_tiny, swift_net_small, swift_net_base, SWIFTNet
 from swiftnet.config import SWIFTNetConfig
+
+
+# ---------------------------------------------------------------------------
+# Helper: compute GFLOPs (fvcore preferred, thop fallback)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_gflops(
+    model: nn.Module,
+    input_size: tuple[int, int, int, int] = (1, 3, 224, 224),
+) -> float | None:
+    """
+    Return GFLOPs for one forward pass.
+
+    Tries fvcore first, then thop. Returns None if neither is installed.
+    Batch dimension is forced to 1 — GFLOPs are per-image.
+
+    Install one of:
+        pip install fvcore        # recommended
+        pip install thop          # lightweight alternative
+    """
+    b, c, h, w = input_size
+    x = torch.randn(1, c, h, w)   # always batch=1 for per-image cost
+    model = model.cpu().eval()
+
+    if _FVCORE:
+        flops = FlopCountAnalysis(model, x)
+        flops.unsupported_ops_warnings(False)
+        flops.uncalled_modules_warnings(False)
+        return flops.total() / 1e9  # → GFLOPs
+
+    if _THOP:
+        macs, _ = thop_profile(model, inputs=(x,), verbose=False)
+        return macs / 1e9  # MACs ≈ FLOPs/2; report as GFLOPs (MACs)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Helper: pretty print param counts
 # ---------------------------------------------------------------------------
 
-def print_model_summary(model: SWIFTNet, name: str) -> None:
+def print_model_summary(
+    model: SWIFTNet,
+    name: str,
+    input_size: tuple[int, int, int, int] = (1, 3, 224, 224),
+) -> None:
     counts = model.count_parameters()
     total  = counts["total"]
+    gflops = compute_gflops(model, input_size)
+    gflops_str = f"{gflops:.2f} GFLOPs" if gflops is not None else "n/a (install fvcore or thop)"
     print(f"\n{'='*55}")
     print(f"  {name}")
     print(f"{'='*55}")
     print(f"  Total params:     {total:>12,}  ({total/1e6:.2f}M)")
     print(f"  Trainable params: {counts['trainable']:>12,}")
+    print(f"  GFLOPs @ {input_size[2]}×{input_size[3]}:  {gflops_str}")
     print(f"  Patch embed:      {counts['patch_embed']:>12,}")
     for key, val in counts.items():
         if key.startswith("stage_"):
@@ -178,15 +234,21 @@ def test_gradient_flow():
 
 def test_throughput():
     print("\n[TEST 5] Throughput benchmark")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device     = "cuda" if torch.cuda.is_available() else "cpu"
+    input_size = (1, 3, 224, 224)
 
     for name, factory in [
         ("Tiny  (3M)", swift_net_tiny),
         ("Small (8M)", swift_net_small),
     ]:
         model   = factory(num_classes=1000)
-        results = benchmark(model, input_size=(1, 3, 224, 224), device=device)
-        print(f"  {name}: {results['latency_ms']}ms/img  |  {results['fps']} FPS  [{device}]")
+        gflops  = compute_gflops(model, input_size)
+        results = benchmark(model, input_size=input_size, device=device)
+        gflops_str = f"{gflops:.2f}G" if gflops is not None else "n/a"
+        print(
+            f"  {name}: {results['latency_ms']}ms/img  |  "
+            f"{results['fps']} FPS  |  {gflops_str} FLOPs  [{device}]"
+        )
 
     print("\n[PASS] Throughput benchmark OK")
 
@@ -222,6 +284,33 @@ def test_custom_config():
 
 
 # ---------------------------------------------------------------------------
+# Test 7: GFLOPs at multiple input resolutions
+# ---------------------------------------------------------------------------
+
+def test_gflops():
+    print("\n[TEST 7] GFLOPs")
+
+    if not _FVCORE and not _THOP:
+        print("  SKIP — install fvcore or thop:  pip install fvcore")
+        return
+
+    resolutions = [(224, 224), (256, 256), (384, 384)]
+
+    for model_name, factory in [
+        ("swift_net_tiny",  swift_net_tiny),
+        ("swift_net_small", swift_net_small),
+        ("swift_net_base",  swift_net_base),
+    ]:
+        print(f"\n  {model_name}")
+        model = factory(num_classes=1000)
+        for h, w in resolutions:
+            gflops = compute_gflops(model, input_size=(1, 3, h, w))
+            print(f"    {h}×{w}: {gflops:.3f} GFLOPs")
+
+    print("\n[PASS] GFLOPs OK")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -229,17 +318,13 @@ if __name__ == "__main__":
     print("SWIFT-Net Test Suite")
     print("=" * 55)
 
-    try:
-        test_instantiation()
-        test_forward_pass()
-        test_variable_input_sizes()
-        test_gradient_flow()
-        test_throughput()
-        test_custom_config()
-        print("\n" + "=" * 55)
-        print("  Tất cả tests PASSED!")
-        print("=" * 55)
-    except Exception as e:
-        import traceback
-        print(f"\n[FAIL] {e}")
-        traceback.print_exc()
+    test_instantiation()
+    test_forward_pass()
+    test_variable_input_sizes()
+    test_gradient_flow()
+    test_throughput()
+    test_custom_config()
+    test_gflops()
+    print("\n" + "=" * 55)
+    print("  Tất cả tests PASSED!")
+    print("=" * 55)
