@@ -45,8 +45,8 @@ from torch import Tensor
 from timm.layers import trunc_normal_
 from timm.models import register_model, build_model_with_cfg
 
-from swiftnet.block import SWIFTBlock
-from swiftnet.config import SWIFTNetConfig
+from .swiftnet.block import SWIFTBlock
+from .swiftnet.config import SWIFTNetConfig
 
 
 # ---------------------------------------------------------------------------
