@@ -184,6 +184,7 @@ def get_args_parser():
     
     parser.add_argument('--deploy', action='store_true', default=False)
     parser.add_argument('--project', default='repnext', type=str)
+    parser.add_argument('--no_wandb', action='store_true', default=False)
     return parser
 
 import wandb
@@ -192,7 +193,7 @@ def main(args):
     
     utils.init_distributed_mode(args)
 
-    if utils.is_main_process() and not args.eval:
+    if utils.is_main_process() and not args.eval and not args.no_wandb:
         wandb.init(project=args.project, config=args)
         wandb.run.log_code('model')
     if args.distillation_type != 'none' and args.finetune and not args.eval:
@@ -449,7 +450,7 @@ def main(args):
                         **{f'test_{k}': v for k, v in test_stats.items()},
                         'epoch': epoch,
                         'n_parameters': n_parameters}
-        if utils.is_main_process():
+        if utils.is_main_process() and not args.no_wandb:
             wandb.log({**{f'train_{k}': v for k, v in train_stats.items()},
                     **{f'test_{k}': v for k, v in test_stats.items()},
                     'epoch': epoch,
@@ -461,7 +462,7 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-    if utils.is_main_process():
+    if utils.is_main_process() and not args.no_wandb:
         wandb.finish()
 
 def export_onnx(model, output_dir):

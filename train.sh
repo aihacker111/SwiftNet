@@ -1,1 +1,1 @@
-NCCL_P2P_DISABLE=1 python -m torch.distributed.launch --nproc_per_node=2 --master_port 12346 --use_env main.py --model swift_net_tiny --data-path /kaggle/input/datasets/mayurmadnani/imagenet-dataset --dist-eval
+NCCL_P2P_DISABLE=1 python -m torch.distributed.launch --nproc_per_node=2 --master_port 12346 --use_env main.py --model swift_net_tiny --data-path /kaggle/input/datasets/mayurmadnani/imagenet-dataset --dist-eval --no_wandb 
