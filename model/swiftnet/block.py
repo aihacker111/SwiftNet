@@ -108,6 +108,7 @@ class SWIFTBlock(nn.Module):
         mlp_expand: float = 4.0,
         d_state: int = 16,
         ssm_rank: int = 1,
+        ssm_kernel_size: int = 31,
         kd_rank: int = 16,
         wavelet_levels: int = 2,
         num_rff: int = 64,
@@ -143,12 +144,13 @@ class SWIFTBlock(nn.Module):
             proj_drop=drop,
         )
 
-        # ── Branch 3: DPLR-SSM (sequential long-range) ───────────────────
+        # ── Branch 3: Causal Conv SSM ─────────────────────────────────────
         self.ssm = DPLRStateSpaceModel(
             d_model=dim,
             d_state=d_state,
             rank=ssm_rank,
             dropout=drop,
+            kernel_size=ssm_kernel_size,
         )
         self.ssm_norm = nn.LayerNorm(dim)
 

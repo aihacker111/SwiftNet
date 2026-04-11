@@ -131,12 +131,9 @@ class WaveAttentionWithRoPE(nn.Module):
         cur_H, cur_W = H, W
 
         for _ in range(self.wavelet_levels):
-            new_H, new_W = cur_H // 2, cur_W // 2
-            if new_H < 1 or new_W < 1:
-                break
             # Average pool 2×2 ≈ Haar LL filter (low-pass)
             cur   = F.avg_pool2d(cur, kernel_size=2, stride=2)  # [BnH, D, H/2, W/2]
-            cur_H, cur_W = new_H, new_W
+            cur_H, cur_W = cur_H // 2, cur_W // 2
             levels.append(cur.permute(0, 2, 3, 1).reshape(BnH, cur_H * cur_W, D))
 
         return levels  # list[Tensor]
@@ -301,9 +298,8 @@ class WindowSelfAttentionWithRoPE(nn.Module):
         # ── Padding để H, W_img chia hết cho window_size ─────────────────
         pad_b = (W - H     % W) % W
         pad_r = (W - W_img % W) % W
-        if pad_b > 0 or pad_r > 0:
-            x_2d = F.pad(x_2d, (0, 0, 0, pad_r, 0, pad_b))
-        H_pad, W_pad = x_2d.shape[1], x_2d.shape[2]
+        x_2d = F.pad(x_2d, (0, 0, 0, pad_r, 0, pad_b))  # no-op when pads are 0
+        H_pad, W_pad = H + pad_b, W_img + pad_r
 
         # ── Partition → windows ───────────────────────────────────────────
         x_win = self._partition(x_2d, W)  # [B*nW, W², D]
@@ -338,8 +334,7 @@ class WindowSelfAttentionWithRoPE(nn.Module):
 
         # ── Merge windows → 2D ───────────────────────────────────────────
         out = self._reverse(out, W, H_pad, W_pad)
-        if pad_b > 0 or pad_r > 0:
-            out = out[:, :H, :W_img, :]
+        out = out[:, :H, :W_img, :]  # always slice to original size (no-op when no padding)
 
         # ── Unshift ───────────────────────────────────────────────────────
         if shift:

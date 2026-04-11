@@ -1,433 +1,943 @@
 """
-train_simple.py — Training with DINOv3-style LR/scheduler for SWIFTNet.
+train.py — Dogs vs Cats training with LW-ViT + Albumentations + multi-GPU DDP.
 
-DINOv3 strategy (from dinov3/dinov3/train/):
-  1. LR scaling:  sqrt rule  → lr = base_lr * 4 * sqrt(total_bs / 1024)
-  2. LR schedule: CosineScheduler — linear warmup from 0 → peak, then cosine → min_lr
-  3. WD schedule: CosineScheduler — cosine from wd_start → wd_end  (both scheduled!)
-  4. LLRD:  lr_multiplier = layer_decay ^ (num_blocks + 1 - layer_id)
-            patch_embed → layer_id=0 (lowest LR)
-            stages.S.B → layer_id = cumulative_block_offset + B + 1
-            head/norm   → layer_id = num_blocks + 1 (highest LR)
-  5. No weight decay on bias / norm / gamma / ls1 / ls2
-  6. patch_embed gets additional patch_embed_lr_mult (default 0.2)
-  7. apply_optim_scheduler called every step: sets lr & wd per param group
-  8. Gradient clipping (default 3.0)
+Expected dataset layout:
+    <data_dir>/
+    ├── train/
+    │   ├── cat/    (or any two class names)
+    │   └── dog/
+    └── val/
+        ├── cat/
+        └── dog/
 
-Usage:
-    python train_simple.py
-    python train_simple.py --amp --epochs 20 --batch_size 32
-    python train_simple.py --layer_decay 0.9 --base_lr 1e-3
+Single GPU:
+    python train.py --data-dir /path/to/dataset
+
+Multi-GPU (torchrun, recommended):
+    torchrun --nproc_per_node=4 train.py --data-dir /path/to/dataset
+
+Multi-GPU (legacy torch.distributed.launch):
+    python -m torch.distributed.launch --nproc_per_node=4 --use_env train.py \
+        --data-dir /path/to/dataset
+
+Kaggle example:
+    python train.py --data-dir /kaggle/working/cat-and-dog --epochs 50 --batch-size 64
+
+Install deps:
+    pip install albumentations
 """
 
 import argparse
-import math
+import os
+import sys
 import time
-from collections import defaultdict
-from typing import List
+import datetime
+from pathlib import Path
 
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
-import torchvision.transforms as T
-from torch.utils.data import DataLoader, Dataset
+import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torchvision.datasets import ImageFolder
+from PIL import Image
 
-import model  # registers timm models
-import timm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
+# ── Make sure the local `model` package is importable ──────────────────────
+_DIR = Path(__file__).parent.resolve()
+if str(_DIR) not in sys.path:
+    sys.path.insert(0, str(_DIR))
 
-# ---------------------------------------------------------------------------
-# DINOv3 CosineScheduler (from dinov3/dinov3/train/cosine_lr_scheduler.py)
-# ---------------------------------------------------------------------------
-
-class CosineScheduler:
-    """
-    Precomputed numpy schedule: freeze → linear warmup → cosine decay.
-    Indexed by step: scheduler[it] returns the value at iteration `it`.
-    """
-
-    def __init__(
-        self,
-        base_value: float,
-        final_value: float,
-        total_iters: int,
-        warmup_iters: int = 0,
-        start_warmup_value: float = 0.0,
-        freeze_iters: int = 0,
-    ):
-        self.final_value = final_value
-        self.total_iters = total_iters
-
-        freeze_schedule  = np.zeros(freeze_iters)
-        warmup_schedule  = np.linspace(start_warmup_value, base_value, warmup_iters)
-        iters = np.arange(total_iters - warmup_iters - freeze_iters)
-        cosine_schedule  = (
-            final_value
-            + 0.5 * (base_value - final_value)
-            * (1 + np.cos(np.pi * iters / len(iters)))
-        )
-        self.schedule = np.concatenate(
-            [freeze_schedule, warmup_schedule, cosine_schedule]
-        ).astype(np.float64)
-        assert len(self.schedule) == total_iters
-
-    def __getitem__(self, it: int) -> float:
-        if it >= self.total_iters:
-            return float(self.final_value)
-        return float(self.schedule[it])
+import model  # registers lw_vit_* models with timm
+from model.lw_vit import _param_breakdown, _count_gflops, _measure_latency_ms
+from timm.models import create_model
+import utils  # project-level dist helpers (init_distributed_mode, save_on_master, …)
+from train.param_groups import (
+    get_params_groups_with_decay,
+    fuse_params_groups,
+    apply_optim_scheduler,
+)
+from train.cosine_lr_scheduler import CosineScheduler
 
 
-# ---------------------------------------------------------------------------
-# DINOv3 param groups with LLRD
-# (adapted from dinov3/dinov3/train/param_groups.py for SWIFTNet naming)
-# ---------------------------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────────
+# Albumentations transforms
+# ───────────────────────────────────────────────────────────────────────────
 
-def _get_swiftnet_layer_id(name: str, num_blocks: int, stage_offsets: List[int]) -> int:
-    """
-    Map a SWIFTNet parameter name to a layer depth index.
-
-    Layer IDs:
-        0                  — patch_embed
-        1 … num_blocks     — stages.S.B  (cumulative block index + 1)
-        num_blocks + 1     — head, norm, mergers (everything else)
-    """
-    if "patch_embed" in name:
-        return 0
-
-    if "stages." in name:
-        # e.g. "stages.2.3.ffn.w1.weight"
-        parts = name.split(".")
-        try:
-            stage_idx = int(parts[parts.index("stages") + 1])
-            block_idx = int(parts[parts.index("stages") + 2])
-            return stage_offsets[stage_idx] + block_idx + 1
-        except (ValueError, IndexError):
-            pass
-
-    # head, norm, mergers → highest layer id
-    return num_blocks + 1
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 
-def get_params_groups(
-    model: nn.Module,
-    layer_decay: float = 0.9,
-    patch_embed_lr_mult: float = 0.2,
-    weight_decay: float = 0.04,
-) -> List[dict]:
-    """
-    Build per-parameter groups exactly as DINOv3 does:
-      - lr_multiplier  = layer_decay ^ (num_blocks + 1 - layer_id)
-      - wd_multiplier  = 0 for bias / norm / gamma / layer-scale params
-      - patch_embed gets extra lr_multiplier *= patch_embed_lr_mult
-
-    The actual lr and wd values are set every step by apply_optim_scheduler.
-    """
-    # Compute cumulative block offsets per stage
-    stages = getattr(model, "stages", None)
-    if stages is not None:
-        stage_depths = [len(s) for s in stages]
-    else:
-        stage_depths = []
-    num_blocks = sum(stage_depths)
-    stage_offsets = []
-    running = 0
-    for d in stage_depths:
-        stage_offsets.append(running)
-        running += d
-
-    all_params = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-
-        layer_id   = _get_swiftnet_layer_id(name, num_blocks, stage_offsets)
-        lr_mult    = layer_decay ** (num_blocks + 1 - layer_id)
-
-        # No WD on 1-D params: bias, norm weight/bias, layer scale (ls1/ls2/gamma)
-        no_wd = (
-            param.ndim == 1
-            or name.endswith("bias")
-            or "norm" in name
-            or "gamma" in name
-            or name.endswith("ls1")
-            or name.endswith("ls2")
-        )
-        wd_mult = 0.0 if no_wd else 1.0
-
-        if "patch_embed" in name:
-            lr_mult *= patch_embed_lr_mult
-
-        all_params.append({
-            "name":         name,
-            "params":       param,
-            "lr_multiplier": lr_mult,
-            "wd_multiplier": wd_mult,
-            "is_last_layer": "last_layer" in name,
-        })
-
-    # Fuse into fewer groups by (lr_mult, wd_mult, is_last_layer)
-    fused = defaultdict(lambda: {"params": []})
-    for d in all_params:
-        key = f"lr{d['lr_multiplier']:.6f}_wd{d['wd_multiplier']}_ll{d['is_last_layer']}"
-        fused[key]["params"].append(d["params"])
-        fused[key]["lr_multiplier"]  = d["lr_multiplier"]
-        fused[key]["wd_multiplier"]  = d["wd_multiplier"]
-        fused[key]["is_last_layer"]  = d["is_last_layer"]
-        fused[key]["name"]           = key
-        # Placeholder values; overwritten every step by apply_optim_scheduler
-        fused[key]["lr"]             = 0.0
-        fused[key]["weight_decay"]   = 0.0
-
-    return list(fused.values())
+def build_transforms(img_size: int, is_train: bool) -> A.Compose:
+    if is_train:
+        return A.Compose([
+            # Spatial
+            A.RandomResizedCrop(height=img_size, width=img_size,
+                                scale=(0.08, 1.0), ratio=(0.75, 1.33),
+                                interpolation=cv2.INTER_CUBIC),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.05),
+            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1,
+                               rotate_limit=15, p=0.4,
+                               border_mode=cv2.BORDER_REFLECT_101),
+            # Color & texture
+            A.ColorJitter(brightness=0.4, contrast=0.4,
+                          saturation=0.4, hue=0.1, p=0.8),
+            A.HueSaturationValue(hue_shift_limit=10,
+                                 sat_shift_limit=20,
+                                 val_shift_limit=10, p=0.3),
+            A.ToGray(p=0.02),
+            A.GaussianBlur(blur_limit=(3, 7), p=0.2),
+            A.MotionBlur(blur_limit=5, p=0.1),
+            A.Sharpen(alpha=(0.1, 0.3), p=0.2),
+            # Noise & dropout
+            A.GaussNoise(var_limit=(5.0, 30.0), p=0.2),
+            A.CoarseDropout(
+                max_holes=8, max_height=img_size // 8, max_width=img_size // 8,
+                min_holes=1, min_height=img_size // 16, min_width=img_size // 16,
+                fill_value=0, p=0.3,
+            ),
+            # Normalise + to tensor
+            A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ToTensorV2(),
+        ])
+    # Validation: deterministic resize + crop only
+    return A.Compose([
+        A.Resize(height=int(img_size * 256 / 224),
+                 width=int(img_size * 256 / 224),
+                 interpolation=cv2.INTER_CUBIC),
+        A.CenterCrop(height=img_size, width=img_size),
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ])
 
 
-# ---------------------------------------------------------------------------
-# DINOv3 apply_optim_scheduler  (from dinov3/dinov3/train/train.py)
-# ---------------------------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────────
+# Dataset wrapper: feeds numpy arrays to Albumentations
+# ───────────────────────────────────────────────────────────────────────────
 
-def apply_optim_scheduler(optimizer, lr: float, wd: float, last_layer_lr: float):
-    """Set lr and wd on each param group every step."""
-    for pg in optimizer.param_groups:
-        lr_mult = pg["lr_multiplier"]
-        wd_mult = pg["wd_multiplier"]
-        pg["weight_decay"] = wd * wd_mult
-        if pg["is_last_layer"]:
-            pg["lr"] = last_layer_lr * lr_mult
-        else:
-            pg["lr"] = lr * lr_mult
+class AlbumentationsDataset(Dataset):
+    """Wraps torchvision ImageFolder to use Albumentations transforms."""
 
-
-# ---------------------------------------------------------------------------
-# Synthetic dataset
-# ---------------------------------------------------------------------------
-
-class SyntheticImageDataset(Dataset):
-    def __init__(self, num_samples: int = 8192, num_classes: int = 10,
-                 img_size: int = 224, augment: bool = False):
-        torch.manual_seed(42)
-        self.images = torch.randn(num_samples, 3, img_size, img_size)
-        self.labels = torch.randint(0, num_classes, (num_samples,))
-        # Basic augmentation to reduce overfitting
-        if augment:
-            self.transform = T.Compose([
-                T.RandomHorizontalFlip(),
-                T.RandomCrop(img_size, padding=img_size // 8),
-            ])
-        else:
-            self.transform = None
+    def __init__(self, root: str, transform: A.Compose):
+        self.base    = ImageFolder(root)
+        self.transform = transform
+        self.classes        = self.base.classes
+        self.class_to_idx   = self.base.class_to_idx
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.base)
 
     def __getitem__(self, idx):
-        img = self.images[idx]
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, self.labels[idx]
+        path, label = self.base.samples[idx]
+        # Load as RGB numpy array (H, W, 3) for Albumentations
+        image = np.array(Image.open(path).convert('RGB'))
+        augmented = self.transform(image=image)
+        return augmented['image'], label
 
 
-# ---------------------------------------------------------------------------
-# Train / eval
-# ---------------------------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────────
+# Helpers
+# ───────────────────────────────────────────────────────────────────────────
 
-def train_one_epoch(net, loader, criterion, optimizer,
-                    lr_schedule, wd_schedule, last_layer_lr_schedule,
-                    step_offset: int, clip_grad: float,
-                    device, amp, scaler):
-    net.train()
-    total_loss, correct, total = 0.0, 0, 0
+class AverageMeter:
+    def __init__(self):
+        self.reset()
 
-    for batch_idx, (images, labels) in enumerate(loader):
-        it = step_offset + batch_idx
-        lr = lr_schedule[it]
-        wd = wd_schedule[it]
-        ll_lr = last_layer_lr_schedule[it]
-        apply_optim_scheduler(optimizer, lr, wd, ll_lr)
+    def reset(self):
+        self.val = self.avg = self.sum = self.count = 0.0
 
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad(set_to_none=True)
+    def update(self, val, n=1):
+        self.val   = val
+        self.sum  += val * n
+        self.count += n
+        self.avg   = self.sum / self.count
 
-        with torch.autocast(device_type=device.type, enabled=amp):
-            logits = net(images)
-            loss   = criterion(logits, labels)
+    def synchronize(self):
+        """All-reduce sum+count across DDP ranks, then recompute avg."""
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        t = torch.tensor([self.sum, self.count], dtype=torch.float64,
+                         device='cuda')
+        dist.barrier()
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        self.sum, self.count = t[0].item(), t[1].item()
+        self.avg = self.sum / max(self.count, 1)
 
-        if amp:
+
+def accuracy(output: torch.Tensor, target: torch.Tensor) -> float:
+    with torch.no_grad():
+        pred = output.argmax(dim=1)
+        return (pred == target).float().mean().item() * 100.0
+
+
+def format_time(seconds: float) -> str:
+    return str(datetime.timedelta(seconds=int(seconds)))
+
+
+def is_main() -> bool:
+    """True on rank-0 (or when not using distributed)."""
+    return utils.is_main_process()
+
+
+def print_main(*args, **kwargs):
+    """Print only on rank-0."""
+    if is_main():
+        print(*args, **kwargs)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# One epoch
+# ───────────────────────────────────────────────────────────────────────────
+
+def train_one_epoch(
+    model, loader, criterion, optimizer, scaler, device, epoch,
+    clip_grad, lr_schedule, wd_schedule, start_iteration,
+):
+    """
+    Per-iteration LR/WD schedule (DINOv3-style):
+      - lr_schedule[i]  → base LR at global iteration i
+      - wd_schedule[i]  → base WD at global iteration i
+      - apply_optim_scheduler scales each param group by its own
+        lr_multiplier / wd_multiplier (layer-wise LR decay).
+    DDP: gradients are averaged across all ranks automatically by DDP.
+         Metrics are all-reduced at epoch end for accurate reporting.
+    """
+    model.train()
+    loss_m      = AverageMeter()
+    acc_m       = AverageMeter()
+    nan_skipped = 0
+    t0 = time.time()
+
+    for step, (images, targets) in enumerate(loader):
+        global_iter = start_iteration + step
+
+        # ── Per-iteration LR & WD (applied to all param groups) ───────────
+        lr = lr_schedule[global_iter]
+        wd = wd_schedule[global_iter]
+        apply_optim_scheduler(optimizer, lr=lr, wd=wd)
+
+        images  = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+
+        with torch.amp.autocast(device_type=device.type, enabled=scaler is not None):
+            logits = model(images)
+            loss   = criterion(logits, targets)
+
+        # ── NaN / Inf guard ────────────────────────────────────────────────
+        if not torch.isfinite(loss):
+            print_main(
+                f'  [WARN] step {step+1}: non-finite loss ({loss.item()}), '
+                f'skipping update.',
+                flush=True,
+            )
+            nan_skipped += 1
+            if nan_skipped >= 10:
+                print_main(
+                    '  [ERROR] 10 consecutive NaN/Inf losses — weights likely '
+                    'corrupted. Lower --lr or --clip-grad and restart.',
+                    flush=True,
+                )
+                return {'loss': float('nan'), 'acc': acc_m.avg,
+                        'nan_skipped': nan_skipped}
+            continue
+
+        if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
             optimizer.step()
 
-        total_loss += loss.item() * labels.size(0)
-        correct    += (logits.argmax(1) == labels).sum().item()
-        total      += labels.size(0)
+        # Track local metrics; all-reduce happens at epoch end
+        loss_m.update(loss.item(), images.size(0))
+        acc_m.update(accuracy(logits.detach(), targets), images.size(0))
 
-    return {"loss": total_loss / total, "acc": correct / total}
+        if is_main() and ((step + 1) % 20 == 0 or (step + 1) == len(loader)):
+            elapsed = time.time() - t0
+            scale_str = (f'  scale={scaler.get_scale():.0f}'
+                         if scaler is not None else '')
+            print(
+                f'  Epoch [{epoch}] step {step+1:>4}/{len(loader)} | '
+                f'loss {loss_m.avg:.4f} | acc {acc_m.avg:.2f}% | '
+                f'lr={lr:.2e}  wd={wd:.4f}{scale_str}',
+                flush=True,
+            )
+
+    # ── Synchronize metrics across all ranks ──────────────────────────────
+    loss_m.synchronize()
+    acc_m.synchronize()
+
+    if nan_skipped:
+        print_main(f'  [WARN] {nan_skipped} batch(es) skipped due to NaN/Inf loss this epoch.')
+
+    return {'loss': loss_m.avg, 'acc': acc_m.avg, 'nan_skipped': nan_skipped}
 
 
 @torch.no_grad()
-def evaluate(net, loader, criterion, device, amp):
-    net.eval()
-    total_loss, correct, total = 0.0, 0, 0
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
-        with torch.autocast(device_type=device.type, enabled=amp):
-            logits = net(images)
-            loss   = criterion(logits, labels)
-        total_loss += loss.item() * labels.size(0)
-        correct    += (logits.argmax(1) == labels).sum().item()
-        total      += labels.size(0)
-    return {"loss": total_loss / total, "acc": correct / total}
+def evaluate(model, loader, criterion, device, sync_ddp: bool = True):
+    """
+    Evaluate on the val set.  When using a DistributedSampler the sampler
+    may pad the last batch with duplicates; metrics are all-reduced across
+    ranks so the returned values are the global average.
+    """
+    model.eval()
+    loss_m = AverageMeter()
+    acc_m  = AverageMeter()
+
+    for images, targets in loader:
+        images  = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        logits  = model(images)
+        loss    = criterion(logits, targets)
+        loss_m.update(loss.item(), images.size(0))
+        acc_m.update(accuracy(logits, targets), images.size(0))
+
+    # Synchronize across DDP ranks only when every rank participates.
+    # If only rank-0 runs validation (dist_eval=False), syncing here would hang.
+    if sync_ddp:
+        loss_m.synchronize()
+        acc_m.synchronize()
+
+    return {'loss': loss_m.avg, 'acc': acc_m.avg}
 
 
-# ---------------------------------------------------------------------------
-# Args
-# ---------------------------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────────
+# Reparameterization evaluation
+# ───────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def eval_reparam_compare(
+    net,
+    val_loader,
+    criterion,
+    device,
+    img_size: int = 224,
+    fuse_qkv: bool = True,
+    speed_device: str = 'cpu',
+    speed_batch: int = 1,
+    speed_warmup: int = 30,
+    speed_iters: int = 200,
+    verify_samples: int = 8,
+    verify_tol_abs: float = 1e-6,
+    verify_tol_rel: float = 1e-6,
+):
+    """
+    Compare the model before vs after reparameterize() across:
+      - Val accuracy & loss
+      - Parameter count (total + per-group breakdown)
+      - GFLOPs
+      - Latency (ms/image)
+    """
+    from copy import deepcopy
+
+    if not hasattr(net, 'reparameterize'):
+        print('[WARN] Model has no reparameterize() — skipping reparam compare.')
+        return
+
+    W   = 76
+    sep = '─' * W
+    bar = '═' * W
+
+    print(f'\n{bar}')
+    print('  Reparameterization Compare')
+    print(f'  fuse_qkv={fuse_qkv}   speed_device={speed_device}   '
+          f'batch={speed_batch}   warmup={speed_warmup}   iters={speed_iters}')
+    print(bar)
+
+    # ── Build before / after models ────────────────────────────────────────
+    net_b = deepcopy(net).eval().to(device)   # before
+    net_a = deepcopy(net).eval().to(device)   # after
+    net_a.reparameterize(fuse_qkv=fuse_qkv, verbose=False)
+
+    # ── Val accuracy ───────────────────────────────────────────────────────
+    def _eval(m):
+        m.eval()
+        lm, am = AverageMeter(), AverageMeter()
+        for imgs, tgts in val_loader:
+            imgs = imgs.to(device, non_blocking=True)
+            tgts = tgts.to(device, non_blocking=True)
+            out  = m(imgs)
+            lm.update(criterion(out, tgts).item(), imgs.size(0))
+            am.update(accuracy(out, tgts), imgs.size(0))
+        return lm.avg, am.avg
+
+    print(f'\n  Evaluating before reparam ...', flush=True)
+    loss_b, acc_b = _eval(net_b)
+    print(f'  Evaluating after  reparam ...', flush=True)
+    loss_a, acc_a = _eval(net_a)
+
+    # ── Parameter count ────────────────────────────────────────────────────
+    total_b = sum(p.numel() for p in net_b.parameters())
+    total_a = sum(p.numel() for p in net_a.parameters())
+
+    # Per-group breakdown via backbone
+    bb_b = getattr(net_b, 'backbone', net_b)
+    bb_a = getattr(net_a, 'backbone', net_a)
+    try:
+        breakdown_b = _param_breakdown(bb_b)
+        breakdown_a = _param_breakdown(bb_a)
+        has_breakdown = True
+    except Exception:
+        has_breakdown = False
+
+    # ── GFLOPs ─────────────────────────────────────────────────────────────
+    try:
+        gflops_b = _count_gflops(net_b, img_size, device=str(device))
+        gflops_a = _count_gflops(net_a, img_size, device=str(device))
+        has_gflops = True
+    except Exception:
+        has_gflops = False
+
+    # ── Latency ────────────────────────────────────────────────────────────
+    sp_net_b = deepcopy(net_b).to(speed_device)
+    sp_net_a = deepcopy(net_a).to(speed_device)
+    sample   = torch.randn(speed_batch, 3, img_size, img_size, device=speed_device)
+
+    print(f'  Measuring latency on {speed_device} (bs={speed_batch}) ...', flush=True)
+    lat_b = _measure_latency_ms(sp_net_b, sample, warmup=speed_warmup,
+                                iters=speed_iters, device=speed_device)
+    lat_a = _measure_latency_ms(sp_net_a, sample, warmup=speed_warmup,
+                                iters=speed_iters, device=speed_device)
+    del sp_net_b, sp_net_a
+
+    # ── Print table ────────────────────────────────────────────────────────
+    def _row(label, before, after, fmt='.4f', unit=''):
+        b_s  = f'{before:{fmt}}{unit}'
+        a_s  = f'{after:{fmt}}{unit}'
+        diff = after - before
+        sign = '+' if diff >= 0 else ''
+        d_s  = f'{sign}{diff:{fmt}}{unit}'
+        ok   = '  OK' if abs(diff) < 1e-3 * max(abs(before), 1) else ''
+        print(f'  {label:<24}  {b_s:>14}  {a_s:>14}  {d_s:>14}{ok}')
+
+    print(f'\n  {"Metric":<24}  {"Before":>14}  {"After":>14}  {"Delta":>14}')
+    print(f'  {sep}')
+
+    print(f'\n  -- Accuracy & Loss --')
+    _row('Val Acc@1 (%)', acc_b, acc_a, fmt='.3f')
+    _row('Val Loss',      loss_b, loss_a, fmt='.5f')
+
+    print(f'\n  -- Parameters --')
+    _row('Total (M)', total_b / 1e6, total_a / 1e6, fmt='.3f', unit='M')
+    if has_breakdown:
+        groups = [k for k in breakdown_b if k != 'total']
+        for g in groups:
+            vb = breakdown_b.get(g, 0) / 1e6
+            va = breakdown_a.get(g, 0) / 1e6
+            if vb > 0 or va > 0:
+                _row(f'  {g}', vb, va, fmt='.3f', unit='M')
+
+    if has_gflops:
+        print(f'\n  -- Computation --')
+        _row('GFLOPs', gflops_b, gflops_a, fmt='.4f', unit='G')
+
+    print(f'\n  -- Latency ({speed_device}, bs={speed_batch}) --')
+    _row('Latency (ms/img)', lat_b, lat_a, fmt='.3f', unit='ms')
+    speedup = lat_b / max(lat_a, 1e-9)
+    pct     = (lat_a - lat_b) / max(lat_b, 1e-9) * 100
+    sign    = '+' if pct >= 0 else ''
+    print(f'  {"Speedup":<24}  {"":>14}  {speedup:>13.4f}x  '
+          f'({sign}{pct:.2f}%)')
+
+    print(f'\n  {bar}')
+
+    # ── Numerical correctness check ────────────────────────────────────────
+    # CUDA softmax/reduction order can introduce small non-associative drift
+    # after algebraic fusion. Check both absolute and relative errors.
+    max_abs = 0.0
+    max_rel = 0.0
+    for _ in range(max(1, verify_samples)):
+        x = torch.randn(1, 3, img_size, img_size, device=device)
+        out_b = net_b(x)
+        out_a = net_a(x)
+        diff = (out_b - out_a).abs()
+        rel  = diff / out_b.abs().clamp_min(1e-6)
+        max_abs = max(max_abs, diff.max().item())
+        max_rel = max(max_rel, rel.max().item())
+
+    passed = (max_abs <= verify_tol_abs) or (max_rel <= verify_tol_rel)
+    status = 'PASS' if passed else 'FAIL'
+    print(
+        f'  Numerical correctness: max_abs={max_abs:.2e} (tol={verify_tol_abs:.1e})  '
+        f'max_rel={max_rel:.2e} (tol={verify_tol_rel:.1e})  [{status}]'
+    )
+    print(f'  {bar}\n')
+
+    return dict(
+        acc_before=acc_b, acc_after=acc_a,
+        loss_before=loss_b, loss_after=loss_a,
+        params_before=total_b, params_after=total_a,
+        gflops_before=gflops_b if has_gflops else None,
+        gflops_after=gflops_a  if has_gflops else None,
+        latency_before_ms=lat_b, latency_after_ms=lat_a,
+        speedup=speedup, max_abs_error=max_abs, max_rel_error=max_rel, passed=passed,
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Main
+# ───────────────────────────────────────────────────────────────────────────
 
 def get_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model",              default="swift_net_tiny", type=str)
-    p.add_argument("--num_classes",        default=10,     type=int)
-    p.add_argument("--img_size",           default=224,    type=int)
-    p.add_argument("--train_size",         default=1000,   type=int,
-                   help="More samples needed: 3.35M param model overfit 1024 easily")
-    p.add_argument("--val_size",           default=100,   type=int)
-    p.add_argument("--batch_size",         default=16,     type=int)
-    p.add_argument("--epochs",             default=20,     type=int)
-    # DINOv3 defaults from ssl_default_config.yaml
-    p.add_argument("--base_lr",            default=1e-3,   type=float,
-                   help="Base LR before scaling (DINOv3 default: 1e-3)")
-    p.add_argument("--min_lr",             default=1e-6,   type=float)
-    p.add_argument("--weight_decay",       default=0.05,   type=float,
-                   help="Fixed WD for classification (DINOv3's 0.04→0.4 ramp is SSL-only)")
-    p.add_argument("--weight_decay_end",   default=0.05,   type=float,
-                   help="Set equal to weight_decay to keep WD fixed throughout training")
-    p.add_argument("--warmup_epochs",      default=5,      type=int)
-    p.add_argument("--layer_decay",        default=0.9,    type=float,
-                   help="LLRD factor (DINOv3 default: 0.9)")
-    p.add_argument("--patch_embed_lr_mult", default=0.2,   type=float,
-                   help="Extra LR multiplier for patch_embed (DINOv3 default: 0.2)")
-    p.add_argument("--clip_grad",          default=3.0,    type=float)
-    p.add_argument("--freeze_last_layer_epochs", default=1, type=int)
-    p.add_argument("--amp",                action="store_true", default=False)
-    p.add_argument("--device",             default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--num_workers",        default=2,      type=int)
-    return p.parse_args()
+    parser = argparse.ArgumentParser('LW-ViT Dogs vs Cats trainer')
 
+    # Data
+    parser.add_argument('--data-dir', default='./data', type=str,
+                        help='Root folder with train/ and val/ sub-directories')
+    parser.add_argument('--img-size', default=224, type=int)
+    parser.add_argument('--num-classes', default=2, type=int,
+                        help='Number of output classes (2 for dogs vs cats)')
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    # Model
+    parser.add_argument('--model', default='lw_vit_pico_swiglu_cls', type=str,
+                        help='Model name registered in timm (e.g. lw_vit_pico_swiglu_cls, '
+                             'lw_vit_nano_cls, lw_vit_xs_swiglu_cls)')
+    parser.add_argument('--pretrained-ckpt', default='', type=str,
+                        help='Optional path to a pretrained checkpoint (ImageNet). '
+                             'The classifier head will be re-initialised automatically.')
+
+    # Training
+    parser.add_argument('--epochs',     default=100, type=int)
+    parser.add_argument('--batch-size', default=64,  type=int)
+
+    # ── Learning rate (DINOv3-style) ──────────────────────────────────────
+    # Effective LR = base_lr * 4 * sqrt(total_bs / 1024)   [sqrt_wrt_1024]
+    # For bs=64 single GPU: effective = 3e-4 * 4 * sqrt(64/1024) = 3e-4
+    parser.add_argument('--lr',         default=3e-4, type=float,
+                        help='Base LR before batch-size scaling.')
+    parser.add_argument('--lr-scaling', default='sqrt_wrt_1024',
+                        choices=['sqrt_wrt_1024', 'linear_wrt_256', 'none'],
+                        help='LR scaling rule. sqrt_wrt_1024 = DINOv3 default.')
+    parser.add_argument('--min-lr',     default=1e-6, type=float,
+                        help='Final LR after cosine decay.')
+    parser.add_argument('--warmup-epochs', default=5, type=int,
+                        help='Linear LR warmup epochs. Longer warmup prevents '
+                             'early explosion on small datasets.')
+
+    # ── Weight decay cosine schedule ──────────────────────────────────────
+    parser.add_argument('--weight-decay',     default=0.04,  type=float,
+                        help='Initial WD (DINOv3 default: 0.04).')
+    parser.add_argument('--weight-decay-end', default=0.40,  type=float,
+                        help='Final WD after cosine schedule (DINOv3: 0.40).')
+
+    # ── Layer-wise LR decay (LLRD) ────────────────────────────────────────
+    # block i effective_lr = base_lr * layerwise_decay^(num_blocks - i)
+    # last block → lr * 1.0 | patch_embed → lr * 0.9^N * 0.2
+    parser.add_argument('--layerwise-decay',     default=0.9,  type=float,
+                        help='LLRD rate per block (DINOv3 default: 0.9). '
+                             '1.0 disables LLRD.')
+    parser.add_argument('--patch-embed-lr-mult', default=0.2,  type=float,
+                        help='Extra LR multiplier for patch_embed (DINOv3: 0.2).')
+
+    parser.add_argument('--label-smoothing', default=0.1, type=float)
+    parser.add_argument('--clip-grad',  default=1.0, type=float,
+                        help='Gradient clip norm (≤1.0 recommended for ViT).')
+    parser.add_argument('--num-workers', default=4, type=int)
+
+    # Checkpointing
+    parser.add_argument('--output-dir', default='./checkpoints_dogcat', type=str)
+    parser.add_argument('--save-freq',  default=10, type=int,
+                        help='Save a periodic checkpoint every N epochs (0 = disable)')
+    parser.add_argument('--resume',     default='', type=str,
+                        help='Resume from checkpoint path')
+
+    # Reparameterization evaluation
+    parser.add_argument('--eval-reparam', action='store_true', default=False,
+                        help='After training (or with --resume --eval-only), '
+                             'run before vs after reparameterize() comparison.')
+    parser.add_argument('--eval-only',   action='store_true', default=False,
+                        help='Skip training; only run --eval-reparam (requires --resume).')
+    parser.add_argument('--fuse-qkv',   action='store_true',  default=True,
+                        help='Fuse QKV projection during reparameterize() (default: on).')
+    parser.add_argument('--no-fuse-qkv', action='store_false', dest='fuse_qkv')
+    parser.add_argument('--speed-device', default='cuda', type=str,
+                        help='Device for latency benchmark (default: cuda). '
+                             'Use "cpu" for CPU latency.')
+    parser.add_argument('--speed-batch',  default=1,   type=int,
+                        help='Batch size for latency benchmark (default: 1).')
+    parser.add_argument('--speed-warmup', default=30,  type=int)
+    parser.add_argument('--speed-iters',  default=200, type=int)
+
+    # Distributed training
+    parser.add_argument('--world-size', default=1, type=int,
+                        help='Total number of processes (set automatically by torchrun).')
+    parser.add_argument('--dist-url',   default='env://', type=str,
+                        help='URL for distributed init (default: env://, works with torchrun).')
+    parser.add_argument('--dist-eval',  action='store_true', default=False,
+                        help='Use DistributedSampler for validation (default: off — '
+                             'rank-0 evaluates the full val set, which is simpler '
+                             'and avoids padding artefacts).')
+
+    # Misc
+    parser.add_argument('--device', default='cuda', type=str)
+    parser.add_argument('--seed',   default=42, type=int)
+    parser.add_argument('--amp',    action='store_true', default=False,
+                        help='Use automatic mixed precision (default: off)')
+    parser.add_argument('--no-amp', action='store_false', dest='amp')
+
+    return parser.parse_args()
+
 
 def main():
-    args   = get_args()
-    device = torch.device(args.device)
+    args = get_args()
 
-    # ── DINOv3 LR scaling: sqrt rule wrt 1024 ────────────────────────────
-    # lr = base_lr * 4 * sqrt(total_batch_size / 1024)
-    total_bs = args.batch_size  # single GPU; multiply by world_size for DDP
-    lr_peak  = args.base_lr * 4 * math.sqrt(total_bs / 1024.0)
-    lr_min   = args.min_lr  * 4 * math.sqrt(total_bs / 1024.0)
-    print(f"Device: {device}  |  AMP: {args.amp}")
-    print(f"LR scaling (sqrt wrt 1024): base={args.base_lr:.2e} → peak={lr_peak:.2e}, min={lr_min:.2e}")
+    # ── Distributed init ──────────────────────────────────────────────────
+    # Reads RANK / WORLD_SIZE / LOCAL_RANK from env (set by torchrun).
+    # Falls back to single-GPU when those vars are absent.
+    utils.init_distributed_mode(args)
+    num_tasks    = utils.get_world_size()   # total GPUs
+    global_rank  = utils.get_rank()         # this process' rank
 
-    # ── Datasets & loaders ────────────────────────────────────────────────
-    train_ds = SyntheticImageDataset(args.train_size, args.num_classes, args.img_size, augment=False)
-    val_ds   = SyntheticImageDataset(args.val_size,   args.num_classes, args.img_size, augment=False)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
+    # ── Device & reproducibility ───────────────────────────────────────────
+    if args.distributed:
+        device = torch.device(f'cuda:{args.gpu}')
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
-    steps_per_epoch = len(train_loader)
-    total_steps     = steps_per_epoch * args.epochs
-    warmup_steps    = steps_per_epoch * args.warmup_epochs
-    freeze_ll_steps = steps_per_epoch * args.freeze_last_layer_epochs
-    print(f"Train {len(train_ds)} | Val {len(val_ds)} | "
-          f"{steps_per_epoch} steps/epoch | {warmup_steps} warmup steps")
+    # Per-rank seed so each GPU gets different random augmentations
+    seed = args.seed + global_rank
+    torch.manual_seed(seed)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(seed)
+        # Deterministic / strict numeric settings (helps before-vs-after
+        # reparameterization comparisons be more stable on CUDA).
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-    # ── Model (layer scale stays at 1e-5 as designed) ────────────────────
-    net = timm.create_model(
-        args.model, pretrained=False, num_classes=args.num_classes,
-    ).to(device)
+    # ── Datasets ──────────────────────────────────────────────────────────
+    train_dir = os.path.join(args.data_dir, 'train')
+    val_dir   = os.path.join(args.data_dir, 'val')
+
+    if not os.path.isdir(train_dir) or not os.path.isdir(val_dir):
+        raise FileNotFoundError(
+            f'Expected sub-folders "train/" and "val/" inside {args.data_dir}.\n'
+            f'Please organise your data as:\n'
+            f'  {args.data_dir}/train/cat/  {args.data_dir}/train/dog/\n'
+            f'  {args.data_dir}/val/cat/    {args.data_dir}/val/dog/'
+        )
+
+    train_dataset = AlbumentationsDataset(train_dir, transform=build_transforms(args.img_size, True))
+    val_dataset   = AlbumentationsDataset(val_dir,   transform=build_transforms(args.img_size, False))
+
+    # Auto-detect number of classes from folder structure
+    detected_classes = len(train_dataset.classes)
+    if detected_classes != args.num_classes:
+        print_main(
+            f'[WARNING] --num-classes={args.num_classes} but detected '
+            f'{detected_classes} classes: {train_dataset.classes}. '
+            f'Using {detected_classes}.'
+        )
+        args.num_classes = detected_classes
+
+    print_main(f'Classes : {train_dataset.classes}  ({args.num_classes} total)')
+    print_main(f'Train   : {len(train_dataset):,} images')
+    print_main(f'Val     : {len(val_dataset):,} images')
+    print_main(f'GPUs    : {num_tasks}  (global_rank={global_rank})')
+
+    # ── Samplers — DistributedSampler for train; optional for val ─────────
+    if args.distributed:
+        sampler_train = DistributedSampler(
+            train_dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True,
+        )
+        sampler_val = (
+            DistributedSampler(val_dataset, num_replicas=num_tasks,
+                               rank=global_rank, shuffle=False)
+            if args.dist_eval
+            else None          # rank-0 evaluates the full val set
+        )
+    else:
+        sampler_train = None   # DataLoader will use default random shuffle
+        sampler_val   = None
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=(sampler_train is None),   # shuffle only when no sampler
+        sampler=sampler_train,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=int(args.batch_size * 1.5),
+        shuffle=False,
+        sampler=sampler_val,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    # ── Model ─────────────────────────────────────────────────────────────
+    print_main(f'\nCreating model: {args.model}  (num_classes={args.num_classes})')
+    net = create_model(args.model, num_classes=args.num_classes, pretrained=False)
+
+    if args.pretrained_ckpt:
+        print_main(f'Loading pretrained weights from {args.pretrained_ckpt}')
+        ckpt  = torch.load(args.pretrained_ckpt, map_location='cpu')
+        state = ckpt.get('model', ckpt)
+        # Drop the classification head so it gets re-initialised
+        state = {k: v for k, v in state.items() if not k.startswith('head.')}
+        msg   = net.load_state_dict(state, strict=False)
+        print_main(f'  load_state_dict: {msg}')
+
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    print(f"Model: {args.model}  |  Params: {n_params/1e6:.2f}M")
+    print_main(f'Parameters: {n_params / 1e6:.3f} M')
+    net = net.to(device)
 
-    # ── DINOv3 precomputed schedules ──────────────────────────────────────
+    # ── Wrap with DDP ─────────────────────────────────────────────────────
+    net_without_ddp = net          # keep a reference to the unwrapped model
+    if args.distributed:
+        net = DDP(net, device_ids=[args.gpu])
+        net_without_ddp = net.module
+
+    # ── Loss ──────────────────────────────────────────────────────────────
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+
+    # ── Optimizer with layer-wise LR decay (LLRD) ─────────────────────────
+    # Build from net_without_ddp so parameter names match the underlying model
+    # (DDP wraps names with "module." prefix which confuses the LLRD logic).
+    all_param_groups = get_params_groups_with_decay(
+        net_without_ddp,
+        lr_decay_rate=args.layerwise_decay,
+        patch_embed_lr_mult=args.patch_embed_lr_mult,
+    )
+    fused_groups = list(fuse_params_groups(all_param_groups))
+    optimizer = optim.AdamW(
+        fused_groups,
+        lr=args.lr,          # overridden per-iteration by apply_optim_scheduler
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.95),   # beta2=0.95: standard for ViT (0.999 delays 2nd-moment warm-up)
+        eps=1e-8,
+    )
+
+    # ── Per-iteration LR & WD cosine schedules (DINOv3-style) ────────────
+    iters_per_epoch = len(train_loader)
+    total_iters     = args.epochs * iters_per_epoch
+    warmup_iters    = args.warmup_epochs * iters_per_epoch
+
+    # Apply batch-size scaling to the base LR.
+    # With DDP, total_batch_size = per_gpu_batch * num_gpus.
+    import math
+    total_batch_size = args.batch_size * num_tasks
+    if args.lr_scaling == 'sqrt_wrt_1024':
+        scaled_lr = args.lr * 4.0 * math.sqrt(total_batch_size / 1024.0)
+    elif args.lr_scaling == 'linear_wrt_256':
+        scaled_lr = args.lr * total_batch_size / 256.0
+    else:
+        scaled_lr = args.lr
+    print_main(
+        f'LR scaling ({args.lr_scaling}): {args.lr:.2e} → {scaled_lr:.2e} '
+        f'(total_bs={total_batch_size}  gpus={num_tasks})'
+    )
+
     lr_schedule = CosineScheduler(
-        base_value=lr_peak,
-        final_value=lr_min,
-        total_iters=total_steps,
-        warmup_iters=warmup_steps,
+        base_value=scaled_lr,
+        final_value=args.min_lr,
+        total_iters=total_iters,
+        warmup_iters=warmup_iters,
         start_warmup_value=0.0,
     )
     wd_schedule = CosineScheduler(
         base_value=args.weight_decay,
         final_value=args.weight_decay_end,
-        total_iters=total_steps,
-    )
-    # last-layer LR: same as lr_schedule but frozen for first N steps
-    last_layer_lr_schedule = CosineScheduler(
-        base_value=lr_peak,
-        final_value=lr_min,
-        total_iters=total_steps,
-        warmup_iters=warmup_steps,
-        start_warmup_value=0.0,
-        freeze_iters=freeze_ll_steps,
+        total_iters=total_iters,
     )
 
-    # ── DINOv3 param groups with LLRD ────────────────────────────────────
-    param_groups = get_params_groups(
-        net,
-        layer_decay=args.layer_decay,
-        patch_embed_lr_mult=args.patch_embed_lr_mult,
-        weight_decay=args.weight_decay,
+    print_main(
+        f'Schedule: iters_per_epoch={iters_per_epoch}  '
+        f'total_iters={total_iters}  warmup_iters={warmup_iters}\n'
+        f'  LR: {scaled_lr:.2e} → {args.min_lr:.2e}  '
+        f'WD: {args.weight_decay} → {args.weight_decay_end}'
     )
-    print(f"Param groups: {len(param_groups)}")
-    for g in sorted(param_groups, key=lambda x: -x["lr_multiplier"])[:5]:
-        n = sum(p.numel() for p in g["params"])
-        print(f"  lr_mult={g['lr_multiplier']:.4f}  wd_mult={g['wd_multiplier']}  "
-              f"last_layer={g['is_last_layer']}  params={n/1e3:.1f}k")
+    if is_main():
+        print('Layer-wise LR decay (LLRD):')
+        _seen = set()
+        for pg in fused_groups:
+            mult = pg['lr_multiplier']
+            eff  = scaled_lr * mult
+            if mult not in _seen:
+                print(f'  lr_multiplier={mult:.4f}  effective_lr={eff:.2e}')
+                _seen.add(mult)
 
-    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999))
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    scaler    = torch.cuda.amp.GradScaler(enabled=args.amp)
+    # init_scale=2**10: avoids fp16 overflow on small models
+    # (PyTorch default 2**16 is too aggressive for small-scale training)
+    scaler = (
+        torch.amp.GradScaler('cuda', init_scale=2**10, growth_interval=2000)
+        if (args.amp and device.type == 'cuda') else None
+    )
+
+    # ── Resume ────────────────────────────────────────────────────────────
+    start_epoch  = 0
+    best_acc     = 0.0
+    output_dir   = Path(args.output_dir)
+    if is_main():
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.resume:
+        print_main(f'Resuming from {args.resume}')
+        ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
+        net_without_ddp.load_state_dict(ckpt['model'])
+        # Optimizer state can be incompatible when param-group logic changed
+        # between old and new train.py versions (e.g., different LLRD groups).
+        if 'optimizer' in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer'])
+            except ValueError as e:
+                print_main(
+                    f'[WARN] Could not load optimizer state from checkpoint: {e}\n'
+                    '       Continuing with freshly initialized optimizer.'
+                )
+        start_epoch = ckpt['epoch'] + 1
+        best_acc    = ckpt.get('best_acc', 0.0)
+        if scaler is not None and 'scaler' in ckpt:
+            try:
+                scaler.load_state_dict(ckpt['scaler'])
+            except Exception as e:
+                print_main(
+                    f'[WARN] Could not load AMP scaler state: {e}\n'
+                    '       Continuing with a fresh GradScaler.'
+                )
+        print_main(f'  Resumed at epoch {start_epoch}, best_acc={best_acc:.2f}%')
+
+    # ── Eval-only (reparam compare without training) ──────────────────────
+    if args.eval_only:
+        if not args.resume:
+            raise ValueError('--eval-only requires --resume /path/to/checkpoint.pth')
+        if is_main():
+            print('\n[eval-only] Skipping training.')
+            eval_reparam_compare(
+                net_without_ddp, val_loader, criterion, device,
+                img_size=args.img_size,
+                fuse_qkv=args.fuse_qkv,
+                speed_device=args.speed_device,
+                speed_batch=args.speed_batch,
+                speed_warmup=args.speed_warmup,
+                speed_iters=args.speed_iters,
+            )
+        return
 
     # ── Training loop ─────────────────────────────────────────────────────
-    best_val_acc = 0.0
-    for epoch in range(1, args.epochs + 1):
-        t0          = time.time()
-        step_offset = (epoch - 1) * steps_per_epoch
+    print_main(f'\nTraining for {args.epochs} epochs  |  device={device}  |  GPUs={num_tasks}')
+    print_main('─' * 60)
+    t_start = time.time()
 
+    for epoch in range(start_epoch, args.epochs):
+        ep_t0 = time.time()
+
+        # Tell the DistributedSampler which epoch we're on so each GPU
+        # gets a different random permutation of the training data.
+        if sampler_train is not None:
+            sampler_train.set_epoch(epoch)
+
+        sched_lr = lr_schedule[epoch * iters_per_epoch]
+        sched_wd = wd_schedule[epoch * iters_per_epoch]
+        print_main(f'\nEpoch {epoch+1}/{args.epochs}  base_lr={sched_lr:.2e}  wd={sched_wd:.4f}')
+
+        start_iter  = epoch * iters_per_epoch
         train_stats = train_one_epoch(
-            net, train_loader, criterion, optimizer,
-            lr_schedule, wd_schedule, last_layer_lr_schedule,
-            step_offset, args.clip_grad, device, args.amp, scaler,
-        )
-        val_stats = evaluate(net, val_loader, criterion, device, args.amp)
-
-        # Current LR / WD from schedule (first step of next epoch)
-        it = epoch * steps_per_epoch
-        cur_lr = lr_schedule[min(it, total_steps - 1)]
-        cur_wd = wd_schedule[min(it, total_steps - 1)]
-        elapsed = time.time() - t0
-        print(
-            f"Epoch [{epoch:3d}/{args.epochs}]  "
-            f"train_loss={train_stats['loss']:.4f}  train_acc={train_stats['acc']:.4f}  "
-            f"val_loss={val_stats['loss']:.4f}  val_acc={val_stats['acc']:.4f}  "
-            f"lr={cur_lr:.2e}  wd={cur_wd:.4f}  time={elapsed:.1f}s"
+            net, train_loader, criterion, optimizer, scaler,
+            device, epoch + 1,
+            clip_grad=args.clip_grad,
+            lr_schedule=lr_schedule,
+            wd_schedule=wd_schedule,
+            start_iteration=start_iter,
         )
 
-        if val_stats["acc"] > best_val_acc:
-            best_val_acc = val_stats["acc"]
-            torch.save(net.state_dict(), "best_model.pth")
+        # For distributed eval: if not using dist_eval only rank-0 evaluates
+        if not args.dist_eval and args.distributed:
+            if is_main():
+                val_stats = evaluate(
+                    net_without_ddp, val_loader, criterion, device, sync_ddp=False
+                )
+            else:
+                val_stats = {'loss': 0.0, 'acc': 0.0}
+        else:
+            val_stats = evaluate(net, val_loader, criterion, device)
 
-    print(f"\nDone. Best val acc: {best_val_acc:.4f}  |  Saved to best_model.pth")
+        # Abort if training has fully diverged (unrecoverable NaN)
+        if not torch.isfinite(torch.tensor(train_stats['loss'])):
+            print_main('\n[ERROR] Training diverged (NaN loss). Stopping early.')
+            print_main('Suggestions:')
+            print_main(f'  1. Lower --lr  (current: {args.lr:.0e})  → try {args.lr/3:.0e}')
+            print_main(f'  2. Lower --clip-grad  (current: {args.clip_grad})  → try 0.5')
+            print_main(f'  3. Increase --warmup-epochs  (current: {args.warmup_epochs})')
+            break
+
+        is_best = val_stats['acc'] > best_acc
+        if is_best:
+            best_acc = val_stats['acc']
+
+        epoch_time = time.time() - ep_t0
+        eta        = (args.epochs - epoch - 1) * epoch_time
+        print_main(
+            f'  train  loss={train_stats["loss"]:.4f}  acc={train_stats["acc"]:.2f}%\n'
+            f'  val    loss={val_stats["loss"]:.4f}  acc={val_stats["acc"]:.2f}%  '
+            f'(best={best_acc:.2f}%)\n'
+            f'  time={format_time(epoch_time)}  ETA={format_time(eta)}'
+        )
+
+        # ── Checkpoint saving (rank-0 only via save_on_master) ───────────
+        _ckpt = {
+            'epoch':     epoch,
+            'model':     net_without_ddp.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scaler':    scaler.state_dict() if scaler else None,
+            'best_acc':  best_acc,
+            'classes':   train_dataset.classes,
+            'args':      vars(args),
+        }
+        if is_best:
+            best_path = output_dir / 'checkpoint_best.pth'
+            utils.save_on_master(_ckpt, best_path)
+            print_main(f'  ** Saved best checkpoint -> {best_path}')
+
+        if args.save_freq > 0 and ((epoch + 1) % args.save_freq == 0 or epoch + 1 == args.epochs):
+            ckpt_path = output_dir / f'checkpoint_{epoch}.pth'
+            utils.save_on_master(_ckpt, ckpt_path)
+            # Prune previous periodic checkpoint
+            prev_path = output_dir / f'checkpoint_{epoch - args.save_freq}.pth'
+            if is_main() and prev_path.exists():
+                prev_path.unlink()
+            print_main(f'  Saved periodic checkpoint -> {ckpt_path}')
+
+    total_time = time.time() - t_start
+    print_main(f'\nTraining complete in {format_time(total_time)}')
+    print_main(f'Best val accuracy: {best_acc:.2f}%')
+    print_main(f'Best checkpoint  : {output_dir / "checkpoint_best.pth"}')
+
+    # ── Post-training reparameterization compare (rank-0 only) ────────────
+    if args.eval_reparam and is_main():
+        best_ckpt_path = output_dir / 'checkpoint_best.pth'
+        if best_ckpt_path.exists():
+            print_main(f'\nLoading best checkpoint for reparam eval: {best_ckpt_path}')
+            best_ckpt = torch.load(best_ckpt_path, map_location='cpu')
+            net_without_ddp.load_state_dict(best_ckpt['model'])
+        eval_reparam_compare(
+            net_without_ddp, val_loader, criterion, device,
+            img_size=args.img_size,
+            fuse_qkv=args.fuse_qkv,
+            speed_device=args.speed_device,
+            speed_batch=args.speed_batch,
+            speed_warmup=args.speed_warmup,
+            speed_iters=args.speed_iters,
+        )
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

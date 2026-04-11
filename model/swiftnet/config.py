@@ -22,8 +22,9 @@ class SWIFTNetConfig:
     kd_rank:  int = 16
 
     # ── SSM ───────────────────────────────────────────────────────────────
-    d_state:  int = 16
-    ssm_rank: int = 1
+    d_state:       int = 16
+    ssm_rank:      int = 1
+    ssm_kernel_size: int = 31   # causal conv kernel length (static → ONNX-safe)
 
     # ── FFN ───────────────────────────────────────────────────────────────
     mlp_expand: float = 4.0

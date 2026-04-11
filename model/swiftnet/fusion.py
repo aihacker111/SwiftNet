@@ -31,36 +31,33 @@ from torch import Tensor
 # Walsh-Hadamard Transform (Fast implementation)
 # ---------------------------------------------------------------------------
 
-def fast_wht(x: Tensor) -> Tensor:
+def fast_wht(x: Tensor, N: int) -> Tensor:
     """
-    Fast Walsh-Hadamard Transform — O(N log N), chỉ dùng cộng/trừ.
-    Yêu cầu: chiều cuối (dim=-1) phải là power of 2.
+    Fast Walsh-Hadamard Transform — O(N log N), addition/subtraction only.
+    N must be a power of 2 and passed as a Python int for ONNX compatibility.
+
+    Implemented with reshape + stack butterflies instead of in-place scatter
+    so the entire function is ONNX-exportable without ScatterElements.
 
     Args:
-        x: [..., N]  với N = 2^k
+        x: [B, N]  with N = 2^k  (Python int, not Tensor)
+        N: sequence length as Python int
     Returns:
-        [..., N]  — WHT coefficients
-
-    Implementation: butterfly network (iterative)
+        [B, N]  — WHT coefficients
     """
-    N = x.shape[-1]
-    assert (N & (N - 1)) == 0, f"WHT yêu cầu N là power of 2, nhận N={N}"
-
-    h = x.clone()
+    h = x
     step = 1
+    # Pure Python loop — N and step are Python ints, fully unrolled by tracer
     while step < N:
-        # Butterfly: h[i] ← h[i] + h[i+step],  h[i+step] ← h[i] - h[i+step]
-        i0 = torch.arange(0, N, step * 2, device=x.device)
-        idx = (i0.unsqueeze(1) + torch.arange(step, device=x.device)).flatten()
-        idx_plus = idx + step
-
-        a = h[..., idx]
-        b = h[..., idx_plus]
-        h[..., idx]      = a + b
-        h[..., idx_plus] = a - b
+        num_groups = N // (2 * step)           # Python int
+        # Butterfly: view each group as (a, b) pairs, compute (a+b, a-b)
+        # [B, N] → [B, num_groups, 2, step]
+        h = h.reshape(-1, num_groups, 2, step)
+        a = h[:, :, 0, :]                      # [B, num_groups, step]
+        b = h[:, :, 1, :]
+        h = torch.stack([a + b, a - b], dim=2).reshape(-1, N)  # [B, N]
         step *= 2
-
-    return h / N  # normalize
+    return h / N
 
 
 # ---------------------------------------------------------------------------
@@ -117,14 +114,15 @@ class SEWHTGate(nn.Module):
         # ── Squeeze: Global Average Pool ─────────────────────────────────
         c = x.mean(dim=1)  # [B, D]
 
-        # ── Pad lên power-of-2 ───────────────────────────────────────────
-        if self.padded_dim > D:
-            c_pad = F.pad(c, (0, self.padded_dim - D))  # [B, padded_dim]
+        # ── Pad lên power-of-2 — use stored Python ints for ONNX ────────
+        pad_size = self.padded_dim - self.dim  # Python int, known at init
+        if pad_size > 0:
+            c_pad = F.pad(c, (0, pad_size))    # [B, padded_dim]
         else:
-            c_pad = c  # đã là power-of-2
+            c_pad = c
 
         # ── WHT trong channel domain ──────────────────────────────────────
-        c_wht = fast_wht(c_pad)                        # [B, padded_dim]
+        c_wht = fast_wht(c_pad, self.padded_dim)       # [B, padded_dim]
 
         # ── Học channel importance trong WHT domain ───────────────────────
         c_weighted = c_wht * self.wht_weight           # [B, padded_dim]
@@ -178,17 +176,19 @@ class GMSFusion(nn.Module):
             nn.Linear(dim, dim, bias=False) for _ in range(n_streams)
         ])
 
-        # Learnable fusion weights trong freq domain
-        # shape [n_streams] — softmax-normalized trong forward
+        # Learnable fusion weights — softmax-normalized in forward
         self.fusion_weights = nn.Parameter(torch.ones(n_streams) / n_streams)
 
-        # Final projection sau fusion
+        # Refinement projection (replaces FFT cross-correlation — not ONNX-exportable)
+        self.refine_proj = nn.Linear(dim, dim, bias=False)
+
+        # Final projection after fusion
         self.out_proj = nn.Sequential(
             nn.Linear(dim, dim),
             nn.Dropout(dropout),
         )
 
-        # SE-WHT gate sau fusion
+        # SE-WHT gate after fusion
         self.gate = SEWHTGate(dim)
 
     def forward(self, streams: list[Tensor]) -> Tensor:
@@ -207,24 +207,15 @@ class GMSFusion(nn.Module):
         # ── Normalize fusion weights ──────────────────────────────────────
         weights = torch.softmax(self.fusion_weights, dim=0)  # [n_streams]
 
-        # ── Weighted sum (simple + efficient) ────────────────────────────
-        # Thay vì FFT Hadamard (phức tạp khi n_streams không đồng nhất),
-        # dùng learned weighted sum + gate để học cross-stream interaction
-        fused = sum(w * s for w, s in zip(weights, projected))  # [B, N, D]
+        # ── Weighted sum — stack to avoid Python iteration over tensor ────
+        # zip(weights, projected) iterates a Tensor which breaks ONNX tracing
+        stacked = torch.stack(projected, dim=0)          # [n_streams, B, N, D]
+        fused   = (weights.view(-1, 1, 1, 1) * stacked).sum(0)  # [B, N, D]
 
-        # ── FFT-based refinement — always in fp32 to avoid ComplexHalf NaNs ─
-        N     = fused.shape[1]
-        fft_n = 1 << (N - 1).bit_length()  # next power of 2 >= N
-        fused32 = fused.float()
-        ref32   = projected[0].float()
-        fused_fft = torch.fft.rfft(fused32, n=fft_n, dim=1)
-        ref_fft   = torch.fft.rfft(ref32,   n=fft_n, dim=1)
-        refined   = torch.fft.irfft(fused_fft * ref_fft.conj(),
-                                     n=fft_n, dim=1)[:, :N, :]
-        refined   = refined.to(fused.dtype)  # cast back
-
-        # Blend fused và refined
-        out = 0.8 * fused + 0.2 * refined
+        # ── Learned refinement (replaces FFT cross-correlation) ─────────
+        # FFT ops are not ONNX-exportable; use a linear projection instead
+        refined = self.refine_proj(projected[0])
+        out = fused + 0.2 * refined
 
         # ── Final projection + SE-WHT gate ───────────────────────────────
         out = self.out_proj(out)

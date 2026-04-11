@@ -337,6 +337,7 @@ class SWIFTNet(nn.Module):
                     mlp_expand=config.mlp_expand,
                     d_state=config.d_state,
                     ssm_rank=config.ssm_rank,
+                    ssm_kernel_size=config.ssm_kernel_size,
                     kd_rank=config.kd_rank,
                     wavelet_levels=config.wavelet_levels,
                     num_rff=config.num_rff,

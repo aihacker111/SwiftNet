@@ -227,18 +227,24 @@ def apply_rope_2d(
             x2' = x1 * sin + x2 * cos
         Tương đương nhân số phức: (x1 + j·x2) × (cos + j·sin)
     """
-    # sin/cos [N, D] → [1, N, 1, D/2] cho broadcast với [B, N, nH, D/2]
-    sin_h = sin[None, :, None, ::2]   # lấy D/2 phần tử từ D
-    cos_h = cos[None, :, None, ::2]
+    # Avoid step-2 ONNX Slice ops (not constant-foldable for opset >= 10).
+    # Replace [::2] / [1::2] with reshape-into-pairs + index — all step-1.
+    half_D = x.shape[-1] // 2  # head_dim // 2 — static Python int (set at model init)
 
-    x1 = x[..., ::2]    # [B, N, nH, D/2] — even dims
-    x2 = x[..., 1::2]   # [B, N, nH, D/2] — odd dims
+    # sin/cos: [N, D] → [N, D//2, 2] → take pair-index 0 → [1, N, 1, D//2]
+    sin_h = sin.reshape(-1, half_D, 2)[:, :, 0][None, :, None, :]
+    cos_h = cos.reshape(-1, half_D, 2)[:, :, 0][None, :, None, :]
+
+    # x: [B, N, nH, D] → [B, N, nH, D//2, 2]
+    x_r = x.reshape(*x.shape[:-1], half_D, 2)
+    x1 = x_r[..., 0]   # [B, N, nH, D//2] — even indices, was x[..., ::2]
+    x2 = x_r[..., 1]   # [B, N, nH, D//2] — odd  indices, was x[..., 1::2]
 
     # Rotate và interleave
     out = torch.stack(
         [x1 * cos_h - x2 * sin_h,
          x1 * sin_h + x2 * cos_h],
         dim=-1,
-    )  # [B, N, nH, D/2, 2]
+    )  # [B, N, nH, D//2, 2]
 
     return out.flatten(-2)  # [B, N, nH, D]
