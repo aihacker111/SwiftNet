@@ -29,6 +29,7 @@ from typing import List
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision.transforms as T
 from torch.utils.data import DataLoader, Dataset
 
 import model  # registers timm models
@@ -201,17 +202,28 @@ def apply_optim_scheduler(optimizer, lr: float, wd: float, last_layer_lr: float)
 # ---------------------------------------------------------------------------
 
 class SyntheticImageDataset(Dataset):
-    def __init__(self, num_samples: int = 1024, num_classes: int = 10,
-                 img_size: int = 224):
+    def __init__(self, num_samples: int = 8192, num_classes: int = 10,
+                 img_size: int = 224, augment: bool = False):
         torch.manual_seed(42)
         self.images = torch.randn(num_samples, 3, img_size, img_size)
         self.labels = torch.randint(0, num_classes, (num_samples,))
+        # Basic augmentation to reduce overfitting
+        if augment:
+            self.transform = T.Compose([
+                T.RandomHorizontalFlip(),
+                T.RandomCrop(img_size, padding=img_size // 8),
+            ])
+        else:
+            self.transform = None
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return self.images[idx], self.labels[idx]
+        img = self.images[idx]
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, self.labels[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +293,9 @@ def get_args():
     p.add_argument("--model",              default="swift_net_tiny", type=str)
     p.add_argument("--num_classes",        default=10,     type=int)
     p.add_argument("--img_size",           default=224,    type=int)
-    p.add_argument("--train_size",         default=1024,   type=int)
-    p.add_argument("--val_size",           default=256,    type=int)
+    p.add_argument("--train_size",         default=8192,   type=int,
+                   help="More samples needed: 3.35M param model overfit 1024 easily")
+    p.add_argument("--val_size",           default=1024,   type=int)
     p.add_argument("--batch_size",         default=16,     type=int)
     p.add_argument("--epochs",             default=20,     type=int)
     # DINOv3 defaults from ssl_default_config.yaml
@@ -323,8 +336,8 @@ def main():
     print(f"LR scaling (sqrt wrt 1024): base={args.base_lr:.2e} → peak={lr_peak:.2e}, min={lr_min:.2e}")
 
     # ── Datasets & loaders ────────────────────────────────────────────────
-    train_ds = SyntheticImageDataset(args.train_size, args.num_classes, args.img_size)
-    val_ds   = SyntheticImageDataset(args.val_size,   args.num_classes, args.img_size)
+    train_ds = SyntheticImageDataset(args.train_size, args.num_classes, args.img_size, augment=True)
+    val_ds   = SyntheticImageDataset(args.val_size,   args.num_classes, args.img_size, augment=False)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
