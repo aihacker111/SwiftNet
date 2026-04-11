@@ -54,7 +54,6 @@ if str(_DIR) not in sys.path:
     sys.path.insert(0, str(_DIR))
 
 import model  # registers lw_vit_* models with timm
-from model.lw_vit import _param_breakdown, _count_gflops, _measure_latency_ms
 from timm.models import create_model
 import utils  # project-level dist helpers (init_distributed_mode, save_on_master, …)
 from train.param_groups import (
@@ -501,8 +500,8 @@ def get_args():
                         help='Number of output classes (2 for dogs vs cats)')
 
     # Model
-    parser.add_argument('--model', default='lw_vit_pico_swiglu_cls', type=str,
-                        help='Model name registered in timm (e.g. lw_vit_pico_swiglu_cls, '
+    parser.add_argument('--model', default='swift_net_tiny', type=str,
+                        help='Model name registered in timm (e.g. swift_net_tiny, '
                              'lw_vit_nano_cls, lw_vit_xs_swiglu_cls)')
     parser.add_argument('--pretrained-ckpt', default='', type=str,
                         help='Optional path to a pretrained checkpoint (ImageNet). '
