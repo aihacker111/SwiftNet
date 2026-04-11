@@ -295,7 +295,7 @@ def get_args():
     p.add_argument("--img_size",           default=224,    type=int)
     p.add_argument("--train_size",         default=1000,   type=int,
                    help="More samples needed: 3.35M param model overfit 1024 easily")
-    p.add_argument("--val_size",           default=10,   type=int)
+    p.add_argument("--val_size",           default=100,   type=int)
     p.add_argument("--batch_size",         default=16,     type=int)
     p.add_argument("--epochs",             default=20,     type=int)
     # DINOv3 defaults from ssl_default_config.yaml
