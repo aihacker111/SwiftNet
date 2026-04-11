@@ -250,6 +250,8 @@ def get_args_parser():
     parser.add_argument('--save_freq', default=1, type=int,
                         help='frequency of model saving')
     
+    parser.add_argument('--no-amp', action='store_true', default=False,
+                        help='Disable automatic mixed precision (fp32 training)')
     parser.add_argument('--deploy', action='store_true', default=False)
     parser.add_argument('--project', default='repnext', type=str)
     parser.add_argument('--no_wandb', action='store_true', default=False)
@@ -506,6 +508,7 @@ def main(args):
             wd_schedule=wd_schedule,
             last_layer_lr_schedule=last_layer_lr_schedule,
             step_offset=step_offset,
+            amp=not args.no_amp,
         )
 
         test_stats = evaluate(data_loader_val, model, device)

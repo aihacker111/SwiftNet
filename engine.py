@@ -28,7 +28,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     set_bn_eval=False,
                     # DINOv3-style per-step scheduler
                     lr_schedule=None, wd_schedule=None, last_layer_lr_schedule=None,
-                    step_offset: int = 0,):
+                    step_offset: int = 0, amp: bool = True,):
     model.train(set_training_mode)
     if set_bn_eval:
         set_bn_state(model)
@@ -62,7 +62,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
-        with torch.cuda.amp.autocast():
+        with torch.autocast(device_type="cuda", enabled=amp):
             outputs = model(samples)
             loss = criterion(samples, outputs, targets)
 

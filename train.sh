@@ -18,3 +18,4 @@ NCCL_P2P_DISABLE=1 python -m torch.distributed.launch \
     --output_dir checkpoints \
     --dist-eval \
     --no_wandb
+    # --no-amp  # uncomment to disable mixed precision (fp32)
