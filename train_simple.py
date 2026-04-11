@@ -104,7 +104,7 @@ def get_args():
     p.add_argument("--train_size",   default=1024, type=int)
     p.add_argument("--val_size",     default=256,  type=int)
     p.add_argument("--batch_size",   default=16,   type=int)
-    p.add_argument("--epochs",       default=5,    type=int)
+    p.add_argument("--epochs",       default=20,    type=int)
     p.add_argument("--lr",           default=1e-3, type=float)
     p.add_argument("--weight_decay", default=1e-4, type=float)
     p.add_argument("--amp",          action="store_true", default=False,
