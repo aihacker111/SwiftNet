@@ -4,7 +4,7 @@ NCCL_P2P_DISABLE=1 torchrun \
     main.py \
     --model swift_net_tiny \
     --data-path /kaggle/input/datasets/mayurmadnani/imagenet-dataset \
-    --batch-size 256 \
+    --batch-size 64 \
     --epochs 300 \
     --lr 1e-3 \
     --min-lr 1e-6 \
@@ -17,6 +17,6 @@ NCCL_P2P_DISABLE=1 torchrun \
     --clip-mode norm \
     --output_dir checkpoints \
     --dist-eval \
-    --num_workers 2 \
+    --num_workers 4 \
     --no_wandb
     # --no-amp  # uncomment to disable mixed precision (fp32)
