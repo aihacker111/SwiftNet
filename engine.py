@@ -25,18 +25,37 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     clip_mode: str = 'norm',
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
                     set_training_mode=True,
-                    set_bn_eval=False,):
+                    set_bn_eval=False,
+                    # DINOv3-style per-step scheduler
+                    lr_schedule=None, wd_schedule=None, last_layer_lr_schedule=None,
+                    step_offset: int = 0,):
     model.train(set_training_mode)
     if set_bn_eval:
         set_bn_state(model)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(
         window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('wd', utils.SmoothedValue(
+        window_size=1, fmt='{value:.4f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 100
 
-    for samples, targets in metric_logger.log_every(
-            data_loader, print_freq, header):
+    for batch_idx, (samples, targets) in enumerate(
+            metric_logger.log_every(data_loader, print_freq, header)):
+
+        # ── DINOv3 per-step LR/WD update ─────────────────────────────────
+        if lr_schedule is not None:
+            it = step_offset + batch_idx
+            lr  = lr_schedule[it]
+            wd  = wd_schedule[it]
+            ll_lr = last_layer_lr_schedule[it]
+            for pg in optimizer.param_groups:
+                pg["weight_decay"] = wd * pg["wd_multiplier"]
+                if pg["is_last_layer"]:
+                    pg["lr"] = ll_lr * pg["lr_multiplier"]
+                else:
+                    pg["lr"] = lr * pg["lr_multiplier"]
+
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
@@ -67,6 +86,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
         metric_logger.update(loss=loss_value)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
