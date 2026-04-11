@@ -1,7 +1,7 @@
-NCCL_P2P_DISABLE=1 python -m torch.distributed.launch \
+NCCL_P2P_DISABLE=1 torchrun \
     --nproc_per_node=2 \
     --master_port 12346 \
-    --use_env main.py \
+    main.py \
     --model swift_net_tiny \
     --data-path /kaggle/input/datasets/mayurmadnani/imagenet-dataset \
     --batch-size 256 \
@@ -17,5 +17,6 @@ NCCL_P2P_DISABLE=1 python -m torch.distributed.launch \
     --clip-mode norm \
     --output_dir checkpoints \
     --dist-eval \
+    --num_workers 2 \
     --no_wandb
     # --no-amp  # uncomment to disable mixed precision (fp32)
