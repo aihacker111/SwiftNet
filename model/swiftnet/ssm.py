@@ -186,7 +186,8 @@ class DPLRStateSpaceModel(nn.Module):
         K_t = K.unsqueeze(0).expand(B, -1, -1)         # [B, d_model, L]
 
         # FFT convolution: O(L log L)
-        fft_size = 2 * L  # zero-padding để tránh circular convolution
+        # Round up to next power of 2 — cuFFT fp16 requires power-of-2 sizes
+        fft_size = 1 << (2 * L - 1).bit_length()
         x_fft = torch.fft.rfft(x_t,  n=fft_size, dim=-1)  # [B, d_model, fft//2+1]
         k_fft = torch.fft.rfft(K_t,  n=fft_size, dim=-1)  # [B, d_model, fft//2+1]
         y_fft = x_fft * k_fft
