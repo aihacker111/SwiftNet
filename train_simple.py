@@ -293,9 +293,9 @@ def get_args():
     p.add_argument("--model",              default="swift_net_tiny", type=str)
     p.add_argument("--num_classes",        default=10,     type=int)
     p.add_argument("--img_size",           default=224,    type=int)
-    p.add_argument("--train_size",         default=8192,   type=int,
+    p.add_argument("--train_size",         default=1000,   type=int,
                    help="More samples needed: 3.35M param model overfit 1024 easily")
-    p.add_argument("--val_size",           default=1024,   type=int)
+    p.add_argument("--val_size",           default=10,   type=int)
     p.add_argument("--batch_size",         default=16,     type=int)
     p.add_argument("--epochs",             default=20,     type=int)
     # DINOv3 defaults from ssl_default_config.yaml
@@ -336,7 +336,7 @@ def main():
     print(f"LR scaling (sqrt wrt 1024): base={args.base_lr:.2e} → peak={lr_peak:.2e}, min={lr_min:.2e}")
 
     # ── Datasets & loaders ────────────────────────────────────────────────
-    train_ds = SyntheticImageDataset(args.train_size, args.num_classes, args.img_size, augment=True)
+    train_ds = SyntheticImageDataset(args.train_size, args.num_classes, args.img_size, augment=False)
     val_ds   = SyntheticImageDataset(args.val_size,   args.num_classes, args.img_size, augment=False)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True)
