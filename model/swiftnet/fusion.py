@@ -213,11 +213,13 @@ class GMSFusion(nn.Module):
         fused = sum(w * s for w, s in zip(weights, projected))  # [B, N, D]
 
         # ── FFT-based refinement (optional, học fine-grained interaction) ─
-        # Thực hiện trong chiều N (spatial)
-        fused_fft  = torch.fft.rfft(fused,  dim=1)                # [B, N//2+1, D]
-        ref_fft    = torch.fft.rfft(projected[0], dim=1)          # từ stream đầu
+        # Round N up to next power of 2 — cuFFT fp16 requires power-of-2 sizes
+        N = fused.shape[1]
+        fft_n = 1 << (N - 1).bit_length()
+        fused_fft  = torch.fft.rfft(fused,        n=fft_n, dim=1)  # [B, fft_n//2+1, D]
+        ref_fft    = torch.fft.rfft(projected[0], n=fft_n, dim=1)  # từ stream đầu
         refined    = torch.fft.irfft(fused_fft * ref_fft.conj(),
-                                      n=fused.shape[1], dim=1)    # [B, N, D]
+                                      n=fft_n, dim=1)[..., :N, :]  # [B, N, D]
 
         # Blend fused và refined
         out = 0.8 * fused + 0.2 * refined
