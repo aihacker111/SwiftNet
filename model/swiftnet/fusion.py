@@ -212,14 +212,16 @@ class GMSFusion(nn.Module):
         # dùng learned weighted sum + gate để học cross-stream interaction
         fused = sum(w * s for w, s in zip(weights, projected))  # [B, N, D]
 
-        # ── FFT-based refinement (optional, học fine-grained interaction) ─
-        # Round N up to next power of 2 — cuFFT fp16 requires power-of-2 sizes
-        N = fused.shape[1]
-        fft_n = 1 << (N - 1).bit_length()
-        fused_fft  = torch.fft.rfft(fused,        n=fft_n, dim=1)  # [B, fft_n//2+1, D]
-        ref_fft    = torch.fft.rfft(projected[0], n=fft_n, dim=1)  # từ stream đầu
-        refined    = torch.fft.irfft(fused_fft * ref_fft.conj(),
-                                      n=fft_n, dim=1)[..., :N, :]  # [B, N, D]
+        # ── FFT-based refinement — always in fp32 to avoid ComplexHalf NaNs ─
+        N     = fused.shape[1]
+        fft_n = 1 << (N - 1).bit_length()  # next power of 2 >= N
+        fused32 = fused.float()
+        ref32   = projected[0].float()
+        fused_fft = torch.fft.rfft(fused32, n=fft_n, dim=1)
+        ref_fft   = torch.fft.rfft(ref32,   n=fft_n, dim=1)
+        refined   = torch.fft.irfft(fused_fft * ref_fft.conj(),
+                                     n=fft_n, dim=1)[:, :N, :]
+        refined   = refined.to(fused.dtype)  # cast back
 
         # Blend fused và refined
         out = 0.8 * fused + 0.2 * refined

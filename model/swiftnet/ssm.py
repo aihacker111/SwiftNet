@@ -185,13 +185,14 @@ class DPLRStateSpaceModel(nn.Module):
         x_t = x_in.transpose(1, 2)                     # [B, d_model, L]
         K_t = K.unsqueeze(0).expand(B, -1, -1)         # [B, d_model, L]
 
-        # FFT convolution: O(L log L)
-        # Round up to next power of 2 — cuFFT fp16 requires power-of-2 sizes
-        fft_size = 1 << (2 * L - 1).bit_length()
-        x_fft = torch.fft.rfft(x_t,  n=fft_size, dim=-1)  # [B, d_model, fft//2+1]
-        k_fft = torch.fft.rfft(K_t,  n=fft_size, dim=-1)  # [B, d_model, fft//2+1]
-        y_fft = x_fft * k_fft
-        y     = torch.fft.irfft(y_fft, n=fft_size, dim=-1)[..., :L]  # [B, d_model, L]
+        # FFT convolution: always in fp32 — ComplexHalf is experimental and produces NaNs
+        fft_size = 1 << (2 * L - 1).bit_length()  # next power of 2 >= 2*L
+        x_t32 = x_t.float()
+        K_t32 = K_t.float()
+        x_fft = torch.fft.rfft(x_t32, n=fft_size, dim=-1)
+        k_fft = torch.fft.rfft(K_t32, n=fft_size, dim=-1)
+        y     = torch.fft.irfft(x_fft * k_fft, n=fft_size, dim=-1)[..., :L]
+        y     = y.to(x_t.dtype)  # cast back to original dtype (fp16/bf16/fp32)
 
         # Skip connection (D term)
         y = y + self.D.view(1, -1, 1) * x_t
