@@ -1,19 +1,15 @@
-"""
-SWIFT-Net: State-space Wavelet-Integrated Fast Transformer
-==========================================================
-Kiến trúc model nhẹ cho edge devices, kết hợp:
-  - Wavelet Linear Attention + 2D RoPE  (O(n log n))
-  - Kronecker-factored Depthwise Conv   (8-16× ít params hơn standard conv)
-  - DPLR State Space Model              (long-range context, O(n log n))
-  - SE-WHT Gate                         (không có phép nhân, INT8-friendly)
+from .config    import SWIFTNetConfig
+from .rope_position_encoding      import RopePositionEmbedding, apply_rope_2d
+from .attention import WindowSelfAttention
+from .block     import HybridBlock, DWConvBranch, SwiGLUFFN, DropPath
+# from .model     import SWIFTNet, ConvStem, PatchMerging
+# from .model     import swift_net_tiny, swift_net_small, swift_net_base
 
-Package layout
---------------
-rope.py         — 2D RoPE positional embedding (DINOv3 style)
-attention.py    — WaveAttentionWithRoPE, WindowSelfAttentionWithRoPE
-convolution.py  — KroneckerDepthwiseConv (KD-Conv)
-ssm.py          — DiagonalPlusLowRankSSM (DPLR-SSM)
-fusion.py       — GMSFusion, SEWHTGate
-block.py        — SWIFTBlock (lắp ráp tất cả modules)
-model.py        — SWIFTNet backbone (full model)
-"""
+__all__ = [
+    "SWIFTNetConfig",
+    "RopePositionEmbedding", "apply_rope_2d",
+    "WindowSelfAttention",
+    "HybridBlock", "DWConvBranch", "SwiGLUFFN", "DropPath",
+    "SWIFTNet", "ConvStem", "PatchMerging",
+    "swift_net_tiny", "swift_net_small", "swift_net_base",
+]

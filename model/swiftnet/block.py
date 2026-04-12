@@ -1,36 +1,28 @@
 """
-block.py — SWIFTBlock: unit lặp lại cơ bản của SWIFT-Net
-=========================================================
+block.py — HybridBlock: Depthwise Conv (local) + Window Self-Attention (global)
+================================================================================
 
-Mỗi SWIFTBlock chứa:
-  ┌─────────────────────────────────────────────┐
-  │             LayerNorm                        │
-  │                 ↓                            │
-  │    ┌────────────┼────────────┐               │
-  │    ↓            ↓           ↓               │
-  │  KD-Conv   WaveAttn     DPLR-SSM             │
-  │  (local)   (global)     (long-range)         │
-  │    └────────────┼────────────┘               │
-  │                 ↓                            │
-  │              GMS Fusion                      │
-  │                 ↓                            │
-  │          [late blocks only]                  │
-  │           Window SA + RoPE                   │
-  │                 ↓                            │
-  │            Learnable gate                    │
-  │          alpha*wave + beta*win               │
-  │                 ↓                            │
-  │           Residual + FFN                     │
-  │               (×2/3)                         │
-  └─────────────────────────────────────────────┘
+Each HybridBlock:
+    ┌─────────────────────────────────────┐
+    │          LayerNorm                   │
+    │              ↓                       │
+    │    ┌─────────┴──────────┐            │
+    │    ↓                    ↓            │
+    │  DWConv              WindowAttn      │
+    │  (local)             (global+RoPE)   │
+    │    └─────────┬──────────┘            │
+    │           add + ls1                  │
+    │           Residual                   │
+    │              ↓                       │
+    │           SwiGLU FFN                 │
+    │           Residual + ls2             │
+    └─────────────────────────────────────┘
 
-Tại sao 3 branches song song?
-  - KD-Conv: inductive bias cục bộ, translation invariance
-  - WaveAttn: global context O(n log n)
-  - DPLR-SSM: sequential/temporal structure (tốt cho dense prediction)
-  Mỗi branch capture thông tin bổ sung, GMS Fusion học cách blend.
+- DWConv captures local texture/edge inductive bias at O(N·k²)
+- WindowAttn captures global context at O(N·W²), linear in N
+- Shifted window alternation connects cross-window information
+- Layer scale (1e-2) + DropPath for stable from-scratch training
 """
-
 from __future__ import annotations
 
 import torch
@@ -38,37 +30,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .attention   import WaveAttentionWithRoPE, WindowSelfAttentionWithRoPE
-from .conv import KDConvBlock
-from .ssm         import DPLRStateSpaceModel
-from .fusion      import GMSFusion
+from .attention import WindowSelfAttention
 
 
 # ---------------------------------------------------------------------------
-# SwiGLU FFN — tốt hơn GELU FFN với cùng số params
+# Local branch: Depthwise-Separable Conv
+# ---------------------------------------------------------------------------
+
+class DWConvBranch(nn.Module):
+    """
+    Depthwise-Separable conv for local feature extraction.
+    BN (not LN) for fast inference on edge hardware.
+
+    x [B,N,D] → 2D → DW 3×3 → PW 1×1 → BN → GELU → sequence
+    """
+
+    def __init__(self, dim: int, kernel_size: int = 3):
+        super().__init__()
+        self.dw  = nn.Conv2d(dim, dim, kernel_size, padding=kernel_size // 2,
+                             groups=dim, bias=False)
+        self.pw  = nn.Conv2d(dim, dim, 1, bias=False)
+        self.bn  = nn.BatchNorm2d(dim)
+        self.act = nn.GELU()
+
+    def forward(self, x: Tensor, H: int, W: int) -> Tensor:
+        B, N, D = x.shape
+        out = x.permute(0, 2, 1).reshape(B, D, H, W)
+        out = self.act(self.bn(self.pw(self.dw(out))))
+        return out.flatten(2).transpose(1, 2)   # [B, N, D]
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU FFN
 # ---------------------------------------------------------------------------
 
 class SwiGLUFFN(nn.Module):
     """
-    SwiGLU Feed-Forward Network (Shazeer, 2020).
-    out = (W_1 x) * sigmoid(β * W_1 x) ⊙ (W_2 x)
-    Dùng hidden_dim = 2/3 * expand * dim để giữ số params tương đương GELU FFN.
-
-    Args:
-        dim:         input/output dimension
-        expand:      expansion ratio (mặc định 4 → hidden = 2/3 * 4 * dim)
-        dropout:     dropout rate
+    SwiGLU FFN. hidden = round_up(2/3 * expand * dim, 32).
+    Matches GELU FFN param count at same expand ratio.
     """
 
     def __init__(self, dim: int, expand: float = 4.0, dropout: float = 0.0):
         super().__init__()
         hidden = int(dim * expand * 2 / 3)
-        # Làm tròn lên bội số của 64 cho hardware alignment
-        hidden = ((hidden + 63) // 64) * 64
+        hidden = ((hidden + 31) // 32) * 32
 
-        self.w1 = nn.Linear(dim, hidden, bias=False)   # gate
-        self.w2 = nn.Linear(dim, hidden, bias=False)   # value
-        self.w3 = nn.Linear(hidden, dim, bias=False)   # output
+        self.w1   = nn.Linear(dim, hidden, bias=False)
+        self.w2   = nn.Linear(dim, hidden, bias=False)
+        self.w3   = nn.Linear(hidden, dim, bias=False)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -76,28 +85,43 @@ class SwiGLUFFN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# SWIFTBlock
+# DropPath (Stochastic Depth)
 # ---------------------------------------------------------------------------
 
-class SWIFTBlock(nn.Module):
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep  = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask  = torch.rand(shape, dtype=x.dtype, device=x.device).floor_() + keep
+        return x * mask / keep
+
+    def extra_repr(self) -> str:
+        return f"p={self.drop_prob}"
+
+
+# ---------------------------------------------------------------------------
+# HybridBlock
+# ---------------------------------------------------------------------------
+
+class HybridBlock(nn.Module):
     """
-    Core repeating block của SWIFT-Net.
+    Core repeating block: DWConv (local) + WindowAttn (global) in parallel.
 
     Args:
-        dim:           embedding dimension
-        num_heads:     số attention heads
-        window_size:   kích thước window cho Window SA (late blocks)
-        mlp_expand:    FFN expansion ratio
-        d_state:       SSM state dimension
-        ssm_rank:      SSM low-rank rank
-        kd_rank:       Kronecker conv rank
-        wavelet_levels: Haar pyramid levels
-        num_rff:       Random Fourier Features count
-        rope_base:     RoPE base frequency
-        is_late:       True → thêm Window SA song song
-        block_idx:     index để xác định shift pattern
-        drop:          dropout rate
-        drop_path:     stochastic depth rate
+        dim:         embedding dimension
+        num_heads:   attention heads
+        window_size: window tile size
+        mlp_expand:  FFN expansion ratio
+        rope_base:   RoPE base frequency
+        block_idx:   global index — determines shift pattern
+        drop:        dropout rate
+        drop_path:   stochastic depth rate
     """
 
     def __init__(
@@ -106,150 +130,36 @@ class SWIFTBlock(nn.Module):
         num_heads: int = 8,
         window_size: int = 7,
         mlp_expand: float = 4.0,
-        d_state: int = 16,
-        ssm_rank: int = 1,
-        ssm_kernel_size: int = 31,
-        kd_rank: int = 16,
-        wavelet_levels: int = 2,
-        num_rff: int = 64,
         rope_base: float = 100.0,
-        is_late: bool = False,
         block_idx: int = 0,
         drop: float = 0.0,
         drop_path: float = 0.0,
     ):
         super().__init__()
-        self.is_late   = is_late
-        self.shift     = (block_idx % 2 == 1)  # shift window mỗi block xen kẽ
+        self.shift = (block_idx % 2 == 1)
 
-        # ── Norms ─────────────────────────────────────────────────────────
         self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-
-        # ── Branch 1: KD-Conv (local features) ───────────────────────────
-        self.kd_conv = KDConvBlock(
-            dim=dim,
-            kernel_size=3,
-            rank_p=kd_rank,
-        )
-
-        # ── Branch 2: Wave Attention + RoPE (global, O(n log n)) ─────────
-        self.wave_attn = WaveAttentionWithRoPE(
+        self.conv  = DWConvBranch(dim)
+        self.attn  = WindowSelfAttention(
             dim=dim,
             num_heads=num_heads,
-            num_rff=num_rff,
-            wavelet_levels=wavelet_levels,
+            window_size=window_size,
             rope_base=rope_base,
             attn_drop=drop,
             proj_drop=drop,
         )
 
-        # ── Branch 3: Causal Conv SSM ─────────────────────────────────────
-        self.ssm = DPLRStateSpaceModel(
-            d_model=dim,
-            d_state=d_state,
-            rank=ssm_rank,
-            dropout=drop,
-            kernel_size=ssm_kernel_size,
-        )
-        self.ssm_norm = nn.LayerNorm(dim)
-
-        # ── GMS Fusion (gộp 3 branches) ───────────────────────────────────
-        self.fusion = GMSFusion(dim=dim, n_streams=3, dropout=drop)
-
-        # ── Window SA chỉ cho late blocks ────────────────────────────────
-        if is_late:
-            self.win_attn = WindowSelfAttentionWithRoPE(
-                dim=dim,
-                num_heads=num_heads,
-                window_size=window_size,
-                rope_base=rope_base,
-                attn_drop=drop,
-                proj_drop=drop,
-            )
-            self.win_norm = nn.LayerNorm(dim)
-            # Learnable gate: wave vs window SA
-            # Init [0.5, 0.5] → model tự học balance
-            self.attn_gate = nn.Parameter(torch.zeros(2))
-
-        # ── FFN ───────────────────────────────────────────────────────────
-        self.ffn = SwiGLUFFN(dim=dim, expand=mlp_expand, dropout=drop)
-
-        # ── Stochastic Depth (DropPath) ───────────────────────────────────
+        self.norm2     = nn.LayerNorm(dim)
+        self.ffn       = SwiGLUFFN(dim=dim, expand=mlp_expand, dropout=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-        # ── Layer Scale (init 1e-2 → meaningful residuals from epoch 1) ───
-        # 1e-5/1e-4 is for fine-tuning deep pre-trained ViTs.
-        # For shallow models trained from scratch, 1e-2 lets residuals contribute
-        # immediately without instability (ConvNeXt-style from-scratch setting).
         self.ls1 = nn.Parameter(1e-2 * torch.ones(dim))
         self.ls2 = nn.Parameter(1e-2 * torch.ones(dim))
 
-    def _run_attn_branch(self, x: Tensor, H: int, W: int) -> Tensor:
-        """Chạy attention (wave only hoặc wave + window SA với learnable gate)."""
-        wave_out = self.wave_attn(x, H, W)
-
-        if not self.is_late:
-            return wave_out
-
-        win_out = self.win_attn(self.win_norm(x), H, W, shift=self.shift)
-        gates   = torch.softmax(self.attn_gate, dim=0)  # [2]
-        return gates[0] * wave_out + gates[1] * win_out
-
     def forward(self, x: Tensor, H: int, W: int) -> Tensor:
-        """
-        Args:
-            x:    [B, N, D]  với N = H*W
-            H, W: spatial dimensions
-        Returns:
-            [B, N, D]
-        """
-        residual = x
-        x_norm   = self.norm1(x)
-
-        # ── 3 branches song song ──────────────────────────────────────────
-        conv_out  = self.kd_conv(x_norm, H, W)
-        attn_out  = self._run_attn_branch(x_norm, H, W)
-        ssm_out   = self.ssm(self.ssm_norm(x_norm))
-
-        # ── Fusion ────────────────────────────────────────────────────────
-        fused = self.fusion([conv_out, attn_out, ssm_out])
-
-        # ── Residual + Layer Scale ────────────────────────────────────────
-        x = residual + self.drop_path(self.ls1 * fused)
-
-        # ── FFN ───────────────────────────────────────────────────────────
-        x = x + self.drop_path(self.ls2 * self.ffn(self.norm2(x)))
-
+        """x: [B, N, D]  N = H*W"""
+        x_norm = self.norm1(x)
+        mixed  = self.conv(x_norm, H, W) + self.attn(x_norm, H, W, shift=self.shift)
+        x      = x + self.drop_path(self.ls1 * mixed)
+        x      = x + self.drop_path(self.ls2 * self.ffn(self.norm2(x)))
         return x
-
-
-# ---------------------------------------------------------------------------
-# DropPath (Stochastic Depth)
-# ---------------------------------------------------------------------------
-
-class DropPath(nn.Module):
-    """
-    Stochastic Depth (Huang et al., 2016).
-    Drop toàn bộ residual path với probability p trong training.
-    Scale output bởi 1/(1-p) để giữ kỳ vọng không đổi.
-
-    Args:
-        drop_prob: xác suất drop
-    """
-
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: Tensor) -> Tensor:
-        if not self.training or self.drop_prob == 0.0:
-            return x
-        keep = 1.0 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor = torch.floor(random_tensor + keep)
-        return x * random_tensor / keep
-
-    def extra_repr(self) -> str:
-        return f"p={self.drop_prob}"
