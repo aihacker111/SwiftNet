@@ -23,7 +23,7 @@ import model  # registers swift_net_* models
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model",       default="swift_net_tiny", type=str)
+    p.add_argument("--model",       default="fesa_net_tiny_224", type=str)
     p.add_argument("--checkpoint",  default="",  type=str, help="Path to .pth checkpoint")
     p.add_argument("--output",      default="swift_net.onnx", type=str)
     p.add_argument("--num-classes", default=1000, type=int)

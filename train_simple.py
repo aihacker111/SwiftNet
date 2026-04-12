@@ -481,7 +481,7 @@ def get_args():
                         help='Number of output classes (2 for dogs vs cats)')
 
     # Model
-    parser.add_argument('--model', default='fesa_net_tiny_224', type=str,
+    parser.add_argument('--model', default='fesa_net_small_224', type=str,
                         help='Model name registered in timm (e.g. swift_net_tiny, '
                              'lw_vit_nano_cls, lw_vit_xs_swiglu_cls)')
     parser.add_argument('--pretrained-ckpt', default='', type=str,
