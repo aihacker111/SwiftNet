@@ -516,8 +516,10 @@ def get_args():
     # heuristic, which was tuned for large-batch ImageNet ViT training.
     # For small models trained from scratch, a plain cosine decay from 1e-3
     # converges much faster.
-    parser.add_argument('--lr',         default=1e-3, type=float,
-                        help='Base LR (used directly when --lr-scaling=none).')
+    parser.add_argument('--lr',         default=4e-4, type=float,
+                        help='Base LR (used directly when --lr-scaling=none). '
+                             '4e-4 is the empirically safe peak for swift_net_tiny '
+                             'with bs=128; scale up proportionally for larger batches.')
     parser.add_argument('--lr-scaling', default='none',
                         choices=['sqrt_wrt_1024', 'linear_wrt_256', 'none'],
                         help='LR scaling rule. "none" uses --lr directly.')
@@ -546,8 +548,9 @@ def get_args():
 
     parser.add_argument('--label-smoothing', default=0.05, type=float,
                         help='Label smoothing for CE loss (0.1 hurts binary tasks).')
-    parser.add_argument('--clip-grad',  default=1.0, type=float,
-                        help='Gradient clip norm.')
+    parser.add_argument('--clip-grad',  default=0.5, type=float,
+                        help='Gradient clip norm. 0.5 is safer for small models '
+                             'with BatchNorm stem trained from scratch.')
     parser.add_argument('--num-workers', default=4, type=int)
 
     # Checkpointing
