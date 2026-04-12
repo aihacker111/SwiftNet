@@ -104,11 +104,12 @@ class WaveletPatchEmbed(nn.Module):
 
         # Stronger stem: 3×3 conv extracts local features from DWT sub-bands,
         # then a strided conv downsamples to the patch grid.
-        # The single 2×2 tile-projection was too weak (no feature extraction).
+        # No BatchNorm here — BN is DDP-unfriendly when each GPU has small batch
+        # (stats diverge per-GPU without SyncBN, causing gradient instability).
+        # The trailing LayerNorm on the flattened tokens handles normalisation.
         self.proj = nn.Sequential(
             nn.Conv2d(dwt_channels, embed_dim, kernel_size=3, stride=1,
-                      padding=1, bias=False),
-            nn.BatchNorm2d(embed_dim),
+                      padding=1, bias=True),
             nn.GELU(),
             nn.Conv2d(embed_dim, embed_dim, kernel_size=stride, stride=stride,
                       padding=0, bias=False),

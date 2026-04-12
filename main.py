@@ -19,6 +19,7 @@ from timm.utils import NativeScaler, get_state_dict, ModelEma
 from data.samplers import RASampler
 from data.datasets import build_dataset
 from data.threeaugment import new_data_aug_generator
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
 
@@ -155,6 +156,12 @@ def get_args_parser():
                         help='Minimum LR after cosine decay (default: 1e-5)')
     parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
                         help='Warmup epochs (default: 5)')
+    parser.add_argument('--scheduler', type=str, default='cosine_epoch',
+                        choices=['cosine_epoch', 'cosine_iter'],
+                        help='"cosine_epoch": epoch-based SequentialLR (recommended for '
+                             'from-scratch training, default). '
+                             '"cosine_iter": per-iteration precomputed cosine (DINOv3-style, '
+                             'use for large-batch ImageNet runs).')
     parser.add_argument('--freeze-last-layer-epochs', type=int, default=1,
                         help='Freeze last layer LR for N epochs (default: 1)')
     parser.add_argument('--layer-decay', type=float, default=1.0,
@@ -410,19 +417,42 @@ def main(args):
     warmup_steps    = steps_per_epoch * args.warmup_epochs
     freeze_ll_steps = steps_per_epoch * args.freeze_last_layer_epochs
 
-    lr_schedule = CosineScheduler(
-        base_value=lr_peak, final_value=lr_min,
-        total_iters=total_steps, warmup_iters=warmup_steps,
-    )
-    wd_schedule = CosineScheduler(
-        base_value=args.weight_decay, final_value=args.weight_decay,
-        total_iters=total_steps,
-    )
-    last_layer_lr_schedule = CosineScheduler(
-        base_value=lr_peak, final_value=lr_min,
-        total_iters=total_steps, warmup_iters=warmup_steps,
-        freeze_iters=freeze_ll_steps,
-    )
+    if args.scheduler == 'cosine_epoch':
+        # Epoch-based: stable for from-scratch training on small/medium datasets.
+        # LR is constant within each epoch; cosine decays between epochs.
+        cosine_epochs = args.epochs - args.warmup_epochs
+        lr_schedule   = None   # signal to engine.train_one_epoch to skip per-step update
+        wd_schedule   = None
+        last_layer_lr_schedule = None
+        epoch_scheduler = SequentialLR(
+            optimizer,
+            schedulers=[
+                LinearLR(optimizer, start_factor=1e-2, end_factor=1.0,
+                         total_iters=args.warmup_epochs),
+                CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=lr_min),
+            ],
+            milestones=[args.warmup_epochs],
+        )
+        print(f"Scheduler: cosine_epoch  warmup={args.warmup_epochs}ep  "
+              f"cosine={cosine_epochs}ep  peak={lr_peak:.2e}  min={lr_min:.2e}")
+    else:
+        # Per-iteration DINOv3-style (use for ImageNet-scale long runs)
+        lr_schedule = CosineScheduler(
+            base_value=lr_peak, final_value=lr_min,
+            total_iters=total_steps, warmup_iters=warmup_steps,
+        )
+        wd_schedule = CosineScheduler(
+            base_value=args.weight_decay, final_value=args.weight_decay,
+            total_iters=total_steps,
+        )
+        last_layer_lr_schedule = CosineScheduler(
+            base_value=lr_peak, final_value=lr_min,
+            total_iters=total_steps, warmup_iters=warmup_steps,
+            freeze_iters=freeze_ll_steps,
+        )
+        epoch_scheduler = None
+        print(f"Scheduler: cosine_iter  warmup={warmup_steps}steps  "
+              f"peak={lr_peak:.2e}  min={lr_min:.2e}")
 
     param_groups = get_params_groups(
         model_without_ddp,
@@ -519,12 +549,17 @@ def main(args):
             args.clip_grad, args.clip_mode, model_ema, mixup_fn,
             set_training_mode=True,
             set_bn_eval=args.set_bn_eval,
+            # Pass None when using epoch-based scheduler (no per-step LR updates)
             lr_schedule=lr_schedule,
             wd_schedule=wd_schedule,
             last_layer_lr_schedule=last_layer_lr_schedule,
             step_offset=step_offset,
             amp=not args.no_amp,
         )
+
+        # Epoch-based scheduler step (only active when --scheduler cosine_epoch)
+        if epoch_scheduler is not None:
+            epoch_scheduler.step()
 
         test_stats = evaluate(data_loader_val, model, device)
         print(

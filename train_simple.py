@@ -53,15 +53,10 @@ _DIR = Path(__file__).parent.resolve()
 if str(_DIR) not in sys.path:
     sys.path.insert(0, str(_DIR))
 
-import model  # registers lw_vit_* models with timm
+import model  # registers swift_net_* models with timm
 from timm.models import create_model
 import utils  # project-level dist helpers (init_distributed_mode, save_on_master, …)
-from train.param_groups import (
-    get_params_groups_with_decay,
-    fuse_params_groups,
-    apply_optim_scheduler,
-)
-from train.cosine_lr_scheduler import CosineScheduler
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -194,33 +189,22 @@ def print_main(*args, **kwargs):
 # One epoch
 # ───────────────────────────────────────────────────────────────────────────
 
-def train_one_epoch(
-    model, loader, criterion, optimizer, scaler, device, epoch,
-    clip_grad, lr_schedule, wd_schedule, start_iteration,
-):
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch, clip_grad):
     """
-    Per-iteration LR/WD schedule (DINOv3-style):
-      - lr_schedule[i]  → base LR at global iteration i
-      - wd_schedule[i]  → base WD at global iteration i
-      - apply_optim_scheduler scales each param group by its own
-        lr_multiplier / wd_multiplier (layer-wise LR decay).
-    DDP: gradients are averaged across all ranks automatically by DDP.
-         Metrics are all-reduced at epoch end for accurate reporting.
+    Epoch-based scheduling: LR is set once per epoch by the PyTorch scheduler
+    (SequentialLR) in the main loop before this function is called.
+    WD is fixed in the optimizer param groups — no per-iteration updates needed.
     """
     model.train()
     loss_m      = AverageMeter()
     acc_m       = AverageMeter()
     nan_skipped = 0
-    t0 = time.time()
+    t0          = time.time()
+    # Read current LR / WD from optimizer once per epoch (constant within epoch)
+    cur_lr = optimizer.param_groups[0]['lr']
+    cur_wd = optimizer.param_groups[0].get('weight_decay', 0.0)
 
     for step, (images, targets) in enumerate(loader):
-        global_iter = start_iteration + step
-
-        # ── Per-iteration LR & WD (applied to all param groups) ───────────
-        lr = lr_schedule[global_iter]
-        wd = wd_schedule[global_iter]
-        apply_optim_scheduler(optimizer, lr=lr, wd=wd)
-
         images  = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
@@ -259,22 +243,19 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
             optimizer.step()
 
-        # Track local metrics; all-reduce happens at epoch end
         loss_m.update(loss.item(), images.size(0))
         acc_m.update(accuracy(logits.detach(), targets), images.size(0))
 
         if is_main() and ((step + 1) % 20 == 0 or (step + 1) == len(loader)):
-            elapsed = time.time() - t0
             scale_str = (f'  scale={scaler.get_scale():.0f}'
                          if scaler is not None else '')
             print(
                 f'  Epoch [{epoch}] step {step+1:>4}/{len(loader)} | '
                 f'loss {loss_m.avg:.4f} | acc {acc_m.avg:.2f}% | '
-                f'lr={lr:.2e}  wd={wd:.4f}{scale_str}',
+                f'lr={cur_lr:.2e}  wd={cur_wd:.4f}{scale_str}',
                 flush=True,
             )
 
-    # ── Synchronize metrics across all ranks ──────────────────────────────
     loss_m.synchronize()
     acc_m.synchronize()
 
@@ -511,46 +492,22 @@ def get_args():
     parser.add_argument('--epochs',     default=100, type=int)
     parser.add_argument('--batch-size', default=64,  type=int)
 
-    # ── Learning rate ─────────────────────────────────────────────────────
-    # Use 'none' scaling + a direct LR rather than DINOv3's sqrt_wrt_1024
-    # heuristic, which was tuned for large-batch ImageNet ViT training.
-    # For small models trained from scratch, a plain cosine decay from 1e-3
-    # converges much faster.
-    parser.add_argument('--lr',         default=4e-4, type=float,
-                        help='Base LR (used directly when --lr-scaling=none). '
-                             '4e-4 is the empirically safe peak for swift_net_tiny '
-                             'with bs=128; scale up proportionally for larger batches.')
-    parser.add_argument('--lr-scaling', default='none',
-                        choices=['sqrt_wrt_1024', 'linear_wrt_256', 'none'],
-                        help='LR scaling rule. "none" uses --lr directly.')
-    parser.add_argument('--min-lr',     default=1e-5, type=float,
-                        help='Final LR after cosine decay.')
-    parser.add_argument('--warmup-epochs', default=3, type=int,
-                        help='Linear LR warmup epochs.')
+    # ── Learning rate (epoch-based cosine with linear warmup) ────────────
+    parser.add_argument('--lr',            default=3e-4, type=float,
+                        help='Peak LR after warmup. Stable for swift_net_tiny bs=128.')
+    parser.add_argument('--min-lr',        default=1e-6, type=float,
+                        help='Final LR at end of cosine decay.')
+    parser.add_argument('--warmup-epochs', default=5,   type=int,
+                        help='Linear warmup epochs (0 → peak LR).')
 
     # ── Weight decay (constant) ───────────────────────────────────────────
-    # DINOv3 ramps WD 0.04→0.40 over 800 ImageNet epochs.
-    # For 100-epoch binary classification this massively over-regularises;
-    # keep WD constant at 0.05 (set both to the same value for flat schedule).
-    parser.add_argument('--weight-decay',     default=0.05,  type=float,
-                        help='Weight decay (constant when equal to --weight-decay-end).')
-    parser.add_argument('--weight-decay-end', default=0.05,  type=float,
-                        help='Final WD; set equal to --weight-decay for flat schedule.')
-
-    # ── Layer-wise LR decay (LLRD) ────────────────────────────────────────
-    # LLRD is designed for fine-tuning deep pre-trained models.
-    # For training from scratch, set decay=1.0 (disabled) and mult=1.0.
-    parser.add_argument('--layerwise-decay',     default=1.0,  type=float,
-                        help='LLRD rate per layer (1.0 = disabled, recommended for '
-                             'from-scratch training).')
-    parser.add_argument('--patch-embed-lr-mult', default=1.0,  type=float,
-                        help='Extra LR multiplier for patch_embed (1.0 = no suppression).')
+    parser.add_argument('--weight-decay',  default=0.05, type=float,
+                        help='Weight decay for conv/linear weights.')
 
     parser.add_argument('--label-smoothing', default=0.05, type=float,
-                        help='Label smoothing for CE loss (0.1 hurts binary tasks).')
-    parser.add_argument('--clip-grad',  default=0.5, type=float,
-                        help='Gradient clip norm. 0.5 is safer for small models '
-                             'with BatchNorm stem trained from scratch.')
+                        help='Label smoothing for CE loss.')
+    parser.add_argument('--clip-grad',       default=1.0, type=float,
+                        help='Gradient clip norm.')
     parser.add_argument('--num-workers', default=4, type=int)
 
     # Checkpointing
@@ -716,71 +673,50 @@ def main():
     # ── Loss ──────────────────────────────────────────────────────────────
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
-    # ── Optimizer with layer-wise LR decay (LLRD) ─────────────────────────
-    # Build from net_without_ddp so parameter names match the underlying model
-    # (DDP wraps names with "module." prefix which confuses the LLRD logic).
-    all_param_groups = get_params_groups_with_decay(
-        net_without_ddp,
-        lr_decay_rate=args.layerwise_decay,
-        patch_embed_lr_mult=args.patch_embed_lr_mult,
-    )
-    fused_groups = list(fuse_params_groups(all_param_groups))
+    # ── Optimizer: two param groups (decay / no-decay) ───────────────────
+    # No LLRD for from-scratch training — all layers get equal LR.
+    # No-decay group: 1D params (biases, norms, layer scales ls1/ls2).
+    _no_decay_keywords = ('norm', 'bias', 'ls1', 'ls2')
+    decay_params    = [p for n, p in net_without_ddp.named_parameters()
+                       if p.requires_grad and not (p.ndim == 1 or
+                          any(k in n for k in _no_decay_keywords))]
+    no_decay_params = [p for n, p in net_without_ddp.named_parameters()
+                       if p.requires_grad and (p.ndim == 1 or
+                          any(k in n for k in _no_decay_keywords))]
     optimizer = optim.AdamW(
-        fused_groups,
-        lr=args.lr,          # overridden per-iteration by apply_optim_scheduler
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.999),  # beta2=0.999: standard AdamW; 0.95 was DINOv3-specific
+        [
+            {'params': decay_params,    'weight_decay': args.weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0},
+        ],
+        lr=args.lr,
+        betas=(0.9, 0.999),
         eps=1e-8,
     )
 
-    # ── Per-iteration LR & WD cosine schedules (DINOv3-style) ────────────
-    iters_per_epoch = len(train_loader)
-    total_iters     = args.epochs * iters_per_epoch
-    warmup_iters    = args.warmup_epochs * iters_per_epoch
-
-    # Apply batch-size scaling to the base LR.
-    # With DDP, total_batch_size = per_gpu_batch * num_gpus.
-    import math
-    total_batch_size = args.batch_size * num_tasks
-    if args.lr_scaling == 'sqrt_wrt_1024':
-        scaled_lr = args.lr * 4.0 * math.sqrt(total_batch_size / 1024.0)
-    elif args.lr_scaling == 'linear_wrt_256':
-        scaled_lr = args.lr * total_batch_size / 256.0
-    else:
-        scaled_lr = args.lr
-    print_main(
-        f'LR scaling ({args.lr_scaling}): {args.lr:.2e} → {scaled_lr:.2e} '
-        f'(total_bs={total_batch_size}  gpus={num_tasks})'
-    )
-
-    lr_schedule = CosineScheduler(
-        base_value=scaled_lr,
-        final_value=args.min_lr,
-        total_iters=total_iters,
-        warmup_iters=warmup_iters,
-        start_warmup_value=0.0,
-    )
-    wd_schedule = CosineScheduler(
-        base_value=args.weight_decay,
-        final_value=args.weight_decay_end,
-        total_iters=total_iters,
+    # ── Epoch-based scheduler: linear warmup → cosine decay ──────────────
+    # Epoch-based scheduling is simpler and more stable than per-iteration
+    # for small datasets (62 iters/epoch → cosine barely moves per step).
+    cosine_epochs = args.epochs - args.warmup_epochs
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[
+            # Linear warmup: start_factor × peak → peak  over warmup_epochs
+            LinearLR(optimizer, start_factor=1e-2, end_factor=1.0,
+                     total_iters=args.warmup_epochs),
+            # Cosine decay: peak → min_lr  over remaining epochs
+            CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=args.min_lr),
+        ],
+        milestones=[args.warmup_epochs],
     )
 
     print_main(
-        f'Schedule: iters_per_epoch={iters_per_epoch}  '
-        f'total_iters={total_iters}  warmup_iters={warmup_iters}\n'
-        f'  LR: {scaled_lr:.2e} → {args.min_lr:.2e}  '
-        f'WD: {args.weight_decay} → {args.weight_decay_end}'
+        f'Optimizer: AdamW  lr={args.lr:.2e}  min_lr={args.min_lr:.2e}  '
+        f'wd={args.weight_decay}  warmup={args.warmup_epochs} epochs\n'
+        f'Scheduler: LinearWarmup({args.warmup_epochs}ep) + '
+        f'CosineAnnealing({cosine_epochs}ep)\n'
+        f'Param groups: decay={len(decay_params)} params, '
+        f'no-decay={len(no_decay_params)} params'
     )
-    if is_main():
-        print('Layer-wise LR decay (LLRD):')
-        _seen = set()
-        for pg in fused_groups:
-            mult = pg['lr_multiplier']
-            eff  = scaled_lr * mult
-            if mult not in _seen:
-                print(f'  lr_multiplier={mult:.4f}  effective_lr={eff:.2e}')
-                _seen.add(mult)
 
     # init_scale=2**10: avoids fp16 overflow on small models
     # (PyTorch default 2**16 is too aggressive for small-scale training)
@@ -807,9 +743,14 @@ def main():
                 optimizer.load_state_dict(ckpt['optimizer'])
             except ValueError as e:
                 print_main(
-                    f'[WARN] Could not load optimizer state from checkpoint: {e}\n'
+                    f'[WARN] Could not load optimizer state: {e}\n'
                     '       Continuing with freshly initialized optimizer.'
                 )
+        if 'scheduler' in ckpt:
+            try:
+                scheduler.load_state_dict(ckpt['scheduler'])
+            except Exception as e:
+                print_main(f'[WARN] Could not load scheduler state: {e}')
         start_epoch = ckpt['epoch'] + 1
         best_acc    = ckpt.get('best_acc', 0.0)
         if scaler is not None and 'scaler' in ckpt:
@@ -852,19 +793,17 @@ def main():
         if sampler_train is not None:
             sampler_train.set_epoch(epoch)
 
-        sched_lr = lr_schedule[epoch * iters_per_epoch]
-        sched_wd = wd_schedule[epoch * iters_per_epoch]
-        print_main(f'\nEpoch {epoch+1}/{args.epochs}  base_lr={sched_lr:.2e}  wd={sched_wd:.4f}')
+        cur_lr = optimizer.param_groups[0]['lr']
+        print_main(f'\nEpoch {epoch+1}/{args.epochs}  lr={cur_lr:.2e}  wd={args.weight_decay:.4f}')
 
-        start_iter  = epoch * iters_per_epoch
         train_stats = train_one_epoch(
             net, train_loader, criterion, optimizer, scaler,
             device, epoch + 1,
             clip_grad=args.clip_grad,
-            lr_schedule=lr_schedule,
-            wd_schedule=wd_schedule,
-            start_iteration=start_iter,
         )
+
+        # Step scheduler after each epoch (epoch-based, not per-iteration)
+        scheduler.step()
 
         # For distributed eval: if not using dist_eval only rank-0 evaluates
         if not args.dist_eval and args.distributed:
@@ -880,10 +819,7 @@ def main():
         # Abort if training has fully diverged (unrecoverable NaN)
         if not torch.isfinite(torch.tensor(train_stats['loss'])):
             print_main('\n[ERROR] Training diverged (NaN loss). Stopping early.')
-            print_main('Suggestions:')
-            print_main(f'  1. Lower --lr  (current: {args.lr:.0e})  → try {args.lr/3:.0e}')
-            print_main(f'  2. Lower --clip-grad  (current: {args.clip_grad})  → try 0.5')
-            print_main(f'  3. Increase --warmup-epochs  (current: {args.warmup_epochs})')
+            print_main(f'  → lower --lr (current {args.lr:.0e}) or increase --warmup-epochs')
             break
 
         is_best = val_stats['acc'] > best_acc
@@ -904,6 +840,7 @@ def main():
             'epoch':     epoch,
             'model':     net_without_ddp.state_dict(),
             'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'scaler':    scaler.state_dict() if scaler else None,
             'best_acc':  best_acc,
             'classes':   train_dataset.classes,
