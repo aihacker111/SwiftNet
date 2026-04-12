@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# Adapted from https://github.com/facebookresearch/dinov3 for LW-ViT classification.
+# Adapted from https://github.com/facebookresearch/dinov3 for LW-ViT / SWIFTNet classification.
 
+import re
 import logging
 from collections import defaultdict
 
@@ -10,18 +11,27 @@ logger = logging.getLogger("lw_vit")
 def get_vit_lr_decay_rate(name, lr_decay_rate=1.0, num_layers=12):
     """
     Calculate lr decay rate for different ViT blocks.
-    Adapted from DINOv3 for LW-ViT architecture naming:
-      - backbone.patch_embed.* / backbone.cls_token / backbone.reg_tokens  → layer 0
-      - backbone.blocks.{i}.*                                               → layer i+1
-      - backbone.ln_out.* / head.*                                          → layer num_layers+1 (full lr)
+    Supports both standard ViT naming (blocks.N) and SWIFTNet stage naming (stages.N.N).
+
+      - patch_embed.* / cls_token / reg_tokens  → layer 0  (lowest LR)
+      - blocks.{i}.*   (ViT flat)               → layer i+1
+      - stages.{s}.{b} (SWIFTNet nested)        → layer sum(depths[:s]) + b + 1
+      - head.* / norm.*                         → layer num_layers+1 (full LR)
     """
     layer_id = num_layers + 1  # default: full lr (no decay)
 
     if "patch_embed" in name or "cls_token" in name or "reg_tokens" in name:
         layer_id = 0
     elif ".blocks." in name:
-        # matches both "backbone.blocks.N.*" and "blocks.N.*"
+        # ViT flat naming: backbone.blocks.N.* or blocks.N.*
         layer_id = int(name[name.find(".blocks."):].split(".")[2]) + 1
+    elif "stages." in name:
+        # SWIFTNet nested naming: stages.{stage_i}.{block_i}.*
+        m = re.search(r"stages\.(\d+)", name)
+        if m:
+            # Map each stage to a layer group (stage 0 → layer 1, stage 3 → layer 4)
+            stage_i = int(m.group(1))
+            layer_id = stage_i + 1
 
     return lr_decay_rate ** (num_layers + 1 - layer_id)
 
@@ -29,14 +39,18 @@ def get_vit_lr_decay_rate(name, lr_decay_rate=1.0, num_layers=12):
 def get_params_groups_with_decay(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0):
     """
     Build per-parameter optimizer groups with layerwise LR decay and selective weight decay.
-    Mirrors DINOv3's get_params_groups_with_decay, adapted for LW-ViT classification.
+    Supports both ViT (flat blocks) and SWIFTNet (nested stages) architectures.
 
-    Rules (same as DINOv3):
-      - No weight decay on: biases, LayerNorm params, tokens & positional embeddings.
+    Rules:
+      - No weight decay on: biases, LayerNorm/norm params, tokens & positional embeddings.
       - Layerwise LR decay from the last block back to the patch embedding.
-      - patch_embed gets an additional lr_mult (default 0.2 from DINOv3 config).
+      - patch_embed gets an additional lr_mult (set to 1.0 to disable extra suppression).
     """
-    if hasattr(model, "backbone") and hasattr(model.backbone, "blocks"):
+    if hasattr(model, "stages"):
+        # SWIFTNet: stage-based architecture
+        n_blocks = len(model.stages)
+        logger.info(f"SWIFTNet detected: {n_blocks} stages for LLRD.")
+    elif hasattr(model, "backbone") and hasattr(model.backbone, "blocks"):
         n_blocks = len(model.backbone.blocks)
     elif hasattr(model, "blocks"):
         n_blocks = len(model.blocks)

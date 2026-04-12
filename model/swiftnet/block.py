@@ -178,9 +178,11 @@ class SWIFTBlock(nn.Module):
         # ── Stochastic Depth (DropPath) ───────────────────────────────────
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-        # ── Layer Scale (init 1e-5 → stable training) ────────────────────
-        self.ls1 = nn.Parameter(1e-5 * torch.ones(dim))
-        self.ls2 = nn.Parameter(1e-5 * torch.ones(dim))
+        # ── Layer Scale (init 1e-4 → faster early learning for shallow nets) ─
+        # 1e-5 is designed for deep ViTs fine-tuning from pre-trained weights.
+        # For small models trained from scratch it suppresses residuals too long.
+        self.ls1 = nn.Parameter(1e-4 * torch.ones(dim))
+        self.ls2 = nn.Parameter(1e-4 * torch.ones(dim))
 
     def _run_attn_branch(self, x: Tensor, H: int, W: int) -> Tensor:
         """Chạy attention (wave only hoặc wave + window SA với learnable gate)."""

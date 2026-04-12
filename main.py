@@ -143,19 +143,26 @@ def get_args_parser():
     parser.add_argument('--weight-decay', type=float, default=0.05,
                         help='Fixed weight decay for classification (default: 0.05)')
 
-    # DINOv3-style LR schedule
+    # LR schedule
     parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
-                        help='Base LR before sqrt scaling (default: 1e-3)')
-    parser.add_argument('--min-lr', type=float, default=1e-6, metavar='LR',
-                        help='Minimum LR after cosine decay (default: 1e-6)')
-    parser.add_argument('--warmup-epochs', type=int, default=10, metavar='N',
-                        help='Warmup epochs (default: 10)')
+                        help='Base LR (default: 1e-3)')
+    parser.add_argument('--lr-scaling', type=str, default='none',
+                        choices=['sqrt_wrt_1024', 'linear_wrt_256', 'none'],
+                        help='LR batch-size scaling rule. "none" uses --lr directly '
+                             '(default: none). "sqrt_wrt_1024" is the DINOv3 rule for '
+                             'large-batch ImageNet runs.')
+    parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
+                        help='Minimum LR after cosine decay (default: 1e-5)')
+    parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
+                        help='Warmup epochs (default: 5)')
     parser.add_argument('--freeze-last-layer-epochs', type=int, default=1,
                         help='Freeze last layer LR for N epochs (default: 1)')
-    parser.add_argument('--layer-decay', type=float, default=0.9,
-                        help='LLRD factor per layer (default: 0.9)')
-    parser.add_argument('--patch-embed-lr-mult', type=float, default=0.2,
-                        help='Extra LR multiplier for patch_embed (default: 0.2)')
+    parser.add_argument('--layer-decay', type=float, default=1.0,
+                        help='LLRD factor per layer (1.0 = disabled; recommended for '
+                             'from-scratch training, default: 1.0)')
+    parser.add_argument('--patch-embed-lr-mult', type=float, default=1.0,
+                        help='Extra LR multiplier for patch_embed (1.0 = no suppression, '
+                             'default: 1.0)')
 
     # Augmentation parameters
     parser.add_argument('--ThreeAugment', action='store_true')
@@ -164,8 +171,8 @@ def get_args_parser():
     parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
                         help='Use AutoAugment policy. "v0" or "original". " + \
                              "(default: rand-m9-mstd0.5-inc1)'),
-    parser.add_argument('--smoothing', type=float, default=0.1,
-                        help='Label smoothing (default: 0.1)')
+    parser.add_argument('--smoothing', type=float, default=0.05,
+                        help='Label smoothing (default: 0.05)')
     parser.add_argument('--train-interpolation', type=str, default='bicubic',
                         help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
     parser.add_argument('--repeated-aug', action='store_true')
@@ -383,12 +390,20 @@ def main(args):
                        for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
-    # ── DINOv3-style optimizer & schedules ───────────────────────────────
-    # LR scaling: sqrt rule wrt 1024  (ssl_default_config.yaml: scaling_rule=sqrt_wrt_1024)
+    # ── Optimizer & schedules ─────────────────────────────────────────────
     total_bs = args.batch_size * utils.get_world_size()
-    lr_peak  = args.lr     * 4 * math.sqrt(total_bs / 1024.0)
-    lr_min   = args.min_lr * 4 * math.sqrt(total_bs / 1024.0)
-    print(f"LR sqrt scaling: base={args.lr:.2e} → peak={lr_peak:.2e}, min={lr_min:.2e}")
+    if args.lr_scaling == 'sqrt_wrt_1024':
+        lr_peak = args.lr     * 4 * math.sqrt(total_bs / 1024.0)
+        lr_min  = args.min_lr * 4 * math.sqrt(total_bs / 1024.0)
+        print(f"LR scaling (sqrt_wrt_1024): {args.lr:.2e} → peak={lr_peak:.2e}, min={lr_min:.2e}")
+    elif args.lr_scaling == 'linear_wrt_256':
+        lr_peak = args.lr     * total_bs / 256.0
+        lr_min  = args.min_lr * total_bs / 256.0
+        print(f"LR scaling (linear_wrt_256): {args.lr:.2e} → peak={lr_peak:.2e}, min={lr_min:.2e}")
+    else:
+        lr_peak = args.lr
+        lr_min  = args.min_lr
+        print(f"LR (no scaling): peak={lr_peak:.2e}, min={lr_min:.2e}")
 
     steps_per_epoch = len(data_loader_train)
     total_steps     = steps_per_epoch * args.epochs

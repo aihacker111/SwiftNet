@@ -511,38 +511,43 @@ def get_args():
     parser.add_argument('--epochs',     default=100, type=int)
     parser.add_argument('--batch-size', default=64,  type=int)
 
-    # ── Learning rate (DINOv3-style) ──────────────────────────────────────
-    # Effective LR = base_lr * 4 * sqrt(total_bs / 1024)   [sqrt_wrt_1024]
-    # For bs=64 single GPU: effective = 3e-4 * 4 * sqrt(64/1024) = 3e-4
-    parser.add_argument('--lr',         default=3e-4, type=float,
-                        help='Base LR before batch-size scaling.')
-    parser.add_argument('--lr-scaling', default='sqrt_wrt_1024',
+    # ── Learning rate ─────────────────────────────────────────────────────
+    # Use 'none' scaling + a direct LR rather than DINOv3's sqrt_wrt_1024
+    # heuristic, which was tuned for large-batch ImageNet ViT training.
+    # For small models trained from scratch, a plain cosine decay from 1e-3
+    # converges much faster.
+    parser.add_argument('--lr',         default=1e-3, type=float,
+                        help='Base LR (used directly when --lr-scaling=none).')
+    parser.add_argument('--lr-scaling', default='none',
                         choices=['sqrt_wrt_1024', 'linear_wrt_256', 'none'],
-                        help='LR scaling rule. sqrt_wrt_1024 = DINOv3 default.')
-    parser.add_argument('--min-lr',     default=1e-6, type=float,
+                        help='LR scaling rule. "none" uses --lr directly.')
+    parser.add_argument('--min-lr',     default=1e-5, type=float,
                         help='Final LR after cosine decay.')
-    parser.add_argument('--warmup-epochs', default=5, type=int,
-                        help='Linear LR warmup epochs. Longer warmup prevents '
-                             'early explosion on small datasets.')
+    parser.add_argument('--warmup-epochs', default=3, type=int,
+                        help='Linear LR warmup epochs.')
 
-    # ── Weight decay cosine schedule ──────────────────────────────────────
-    parser.add_argument('--weight-decay',     default=0.04,  type=float,
-                        help='Initial WD (DINOv3 default: 0.04).')
-    parser.add_argument('--weight-decay-end', default=0.40,  type=float,
-                        help='Final WD after cosine schedule (DINOv3: 0.40).')
+    # ── Weight decay (constant) ───────────────────────────────────────────
+    # DINOv3 ramps WD 0.04→0.40 over 800 ImageNet epochs.
+    # For 100-epoch binary classification this massively over-regularises;
+    # keep WD constant at 0.05 (set both to the same value for flat schedule).
+    parser.add_argument('--weight-decay',     default=0.05,  type=float,
+                        help='Weight decay (constant when equal to --weight-decay-end).')
+    parser.add_argument('--weight-decay-end', default=0.05,  type=float,
+                        help='Final WD; set equal to --weight-decay for flat schedule.')
 
     # ── Layer-wise LR decay (LLRD) ────────────────────────────────────────
-    # block i effective_lr = base_lr * layerwise_decay^(num_blocks - i)
-    # last block → lr * 1.0 | patch_embed → lr * 0.9^N * 0.2
-    parser.add_argument('--layerwise-decay',     default=0.9,  type=float,
-                        help='LLRD rate per block (DINOv3 default: 0.9). '
-                             '1.0 disables LLRD.')
-    parser.add_argument('--patch-embed-lr-mult', default=0.2,  type=float,
-                        help='Extra LR multiplier for patch_embed (DINOv3: 0.2).')
+    # LLRD is designed for fine-tuning deep pre-trained models.
+    # For training from scratch, set decay=1.0 (disabled) and mult=1.0.
+    parser.add_argument('--layerwise-decay',     default=1.0,  type=float,
+                        help='LLRD rate per layer (1.0 = disabled, recommended for '
+                             'from-scratch training).')
+    parser.add_argument('--patch-embed-lr-mult', default=1.0,  type=float,
+                        help='Extra LR multiplier for patch_embed (1.0 = no suppression).')
 
-    parser.add_argument('--label-smoothing', default=0.1, type=float)
+    parser.add_argument('--label-smoothing', default=0.05, type=float,
+                        help='Label smoothing for CE loss (0.1 hurts binary tasks).')
     parser.add_argument('--clip-grad',  default=1.0, type=float,
-                        help='Gradient clip norm (≤1.0 recommended for ViT).')
+                        help='Gradient clip norm.')
     parser.add_argument('--num-workers', default=4, type=int)
 
     # Checkpointing
@@ -721,7 +726,7 @@ def main():
         fused_groups,
         lr=args.lr,          # overridden per-iteration by apply_optim_scheduler
         weight_decay=args.weight_decay,
-        betas=(0.9, 0.95),   # beta2=0.95: standard for ViT (0.999 delays 2nd-moment warm-up)
+        betas=(0.9, 0.999),  # beta2=0.999: standard AdamW; 0.95 was DINOv3-specific
         eps=1e-8,
     )
 

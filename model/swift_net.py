@@ -102,12 +102,16 @@ class WaveletPatchEmbed(nn.Module):
         dwt_channels = 4 * in_channels
         stride = patch_size // 2  # DWT đã giảm 2× rồi
 
-        self.proj = nn.Conv2d(
-            dwt_channels, embed_dim,
-            kernel_size=stride,
-            stride=stride,
-            padding=0,
-            bias=False,
+        # Stronger stem: 3×3 conv extracts local features from DWT sub-bands,
+        # then a strided conv downsamples to the patch grid.
+        # The single 2×2 tile-projection was too weak (no feature extraction).
+        self.proj = nn.Sequential(
+            nn.Conv2d(dwt_channels, embed_dim, kernel_size=3, stride=1,
+                      padding=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.GELU(),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=stride, stride=stride,
+                      padding=0, bias=False),
         )
         self.norm = nn.LayerNorm(embed_dim)
 
