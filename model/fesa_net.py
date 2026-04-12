@@ -32,12 +32,12 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from fesanet.config    import FESANetConfig
-from fesanet.dyt       import DyT
-from fesanet.stem      import WAPEStem
-from fesanet.fda_block import FDABlock
-from fesanet.saa_block import SAABlock
-from fesanet.sda_block import SDABlock
+from .fesanet.config    import FESANetConfig
+from .fesanet.dyt       import DyT
+from .fesanet.stem      import WAPEStem
+from .fesanet.fda_block import FDABlock
+from .fesanet.saa_block import SAABlock
+from .fesanet.sda_block import SDABlock
 
 
 # ---------------------------------------------------------------------------
