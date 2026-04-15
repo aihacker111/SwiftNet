@@ -525,15 +525,13 @@ def main(args):
                 loss_scaler.load_state_dict(checkpoint['scaler'])
 
             if epoch_scheduler is not None:
-                if 'epoch_scheduler' in checkpoint and checkpoint['epoch_scheduler'] is not None:
-                    epoch_scheduler.load_state_dict(checkpoint['epoch_scheduler'])
-                else:
-                    saved_lrs = [pg['lr'] for pg in optimizer.param_groups]
-                    print(saved_lrs)
-                    for _ in range(args.start_epoch):
-                        epoch_scheduler.step()
-                    for pg, lr in zip(optimizer.param_groups, saved_lrs):
-                        pg['lr'] = lr
+                # Luôn force fallback để scheduler được rebuild đúng (tránh load state bị lệch)
+                print(f"[Fix LR] Forcing scheduler step {args.start_epoch} times to restore correct LR at epoch {args.start_epoch}")
+                saved_lrs = [pg['lr'] for pg in optimizer.param_groups]
+                for _ in range(args.start_epoch):
+                    epoch_scheduler.step()
+                for pg, lr in zip(optimizer.param_groups, saved_lrs):
+                    pg['lr'] = lr
     if args.eval:
         utils.replace_batchnorm(model) # Users may choose whether to merge Conv-BN layers during eval
         print(f"Evaluating model: {args.model}")
