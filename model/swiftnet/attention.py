@@ -42,7 +42,7 @@ class WindowSelfAttention(nn.Module):
         self.num_heads   = num_heads
         self.head_dim    = dim // num_heads
         self.window_size = window_size
-        self.tau         = tau
+        self.log_tau = nn.Parameter(torch.tensor(tau).log())
 
         self.qkv       = nn.Linear(dim, dim * 3, bias=False)
         self.proj      = nn.Linear(dim, dim, bias=False)
@@ -111,7 +111,7 @@ class WindowSelfAttention(nn.Module):
         k = F.normalize(k, dim=-1).permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        attn = torch.matmul(q, k.transpose(-2, -1)) / self.tau
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.log_tau.exp()
         attn = self.attn_drop(F.softmax(attn, dim=-1))
 
         out = torch.matmul(attn, v)                        # [Bw, nH, W², hd]

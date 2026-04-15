@@ -90,23 +90,50 @@ class RopePositionEmbedding(nn.Module):
         self.periods.data = periods
 
 
-def apply_rope_2d(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
-    """
-    x:   [B, N, nH, head_dim]
-    sin/cos: [N, head_dim]
-    """
-    half_D = x.shape[-1] // 2
+# def apply_rope_2d(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
+#     """
+#     x:   [B, N, nH, head_dim]
+#     sin/cos: [N, head_dim]
+#     """
+#     half_D = x.shape[-1] // 2
 
-    sin_h = sin.reshape(-1, half_D, 2)[:, :, 0][None, :, None, :]
-    cos_h = cos.reshape(-1, half_D, 2)[:, :, 0][None, :, None, :]
+#     sin_h = sin.reshape(-1, half_D, 2)[:, :, 0][None, :, None, :]
+#     cos_h = cos.reshape(-1, half_D, 2)[:, :, 0][None, :, None, :]
 
-    x_r = x.reshape(*x.shape[:-1], half_D, 2)
-    x1  = x_r[..., 0]
-    x2  = x_r[..., 1]
+#     x_r = x.reshape(*x.shape[:-1], half_D, 2)
+#     x1  = x_r[..., 0]
+#     x2  = x_r[..., 1]
 
-    out = torch.stack(
-        [x1 * cos_h - x2 * sin_h,
-         x1 * sin_h + x2 * cos_h],
-        dim=-1,
-    )
-    return out.flatten(-2)
+#     out = torch.stack(
+#         [x1 * cos_h - x2 * sin_h,
+#          x1 * sin_h + x2 * cos_h],
+#         dim=-1,
+#     )
+#     return out.flatten(-2)
+
+
+
+
+
+
+
+def apply_rope_2d(x, sin, cos):
+    B_or_Bw, N, nH, D = x.shape
+    half_D = D // 2
+    # tách rõ: nửa đầu = height encoding, nửa sau = width encoding
+    x_h = x[..., :half_D]
+    x_w = x[..., half_D:]
+    
+    sin_h = sin[:, :half_D]  # [N, half_D]
+    cos_h = cos[:, :half_D]
+    sin_w = sin[:, half_D:]
+    cos_w = cos[:, half_D:]
+    
+    # rotate từng nửa
+    def rotate(z, s, c):
+        z1, z2 = z[..., ::2], z[..., 1::2]
+        s = s[..., ::2][None, :, None, :]
+        c = c[..., ::2][None, :, None, :]
+        return torch.stack([z1*c - z2*s, z1*s + z2*c], dim=-1).flatten(-2)
+    
+    return torch.cat([rotate(x_h, sin_h, cos_h), rotate(x_w, sin_w, cos_w)], dim=-1)

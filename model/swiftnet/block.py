@@ -155,11 +155,12 @@ class HybridBlock(nn.Module):
 
         self.ls1 = nn.Parameter(1e-2 * torch.ones(dim))
         self.ls2 = nn.Parameter(1e-2 * torch.ones(dim))
-
+        self.alpha = nn.Parameter(torch.tensor(0.5))
     def forward(self, x: Tensor, H: int, W: int) -> Tensor:
         """x: [B, N, D]  N = H*W"""
         x_norm = self.norm1(x)
-        mixed  = self.conv(x_norm, H, W) + self.attn(x_norm, H, W, shift=self.shift)
+        alpha = self.alpha.sigmoid()
+        mixed = alpha * self.conv(x_norm, H, W) + (1 - alpha) * self.attn(x_norm, H, W, shift=self.shift)
         x      = x + self.drop_path(self.ls1 * mixed)
         x      = x + self.drop_path(self.ls2 * self.ffn(self.norm2(x)))
         return x
