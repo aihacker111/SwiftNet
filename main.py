@@ -526,6 +526,10 @@ def main(args):
         if not args.eval and 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             args.start_epoch = checkpoint['epoch'] + 1
+            # Checkpoint may omit initial_lr; AdamW would keep constructor initial_lr (~scaled peak).
+            # Anything that syncs lr from initial_lr would then show ~0.02 instead of ~0.001.
+            for pg in optimizer.param_groups:
+                pg['initial_lr'] = pg['lr']
             # LRs from checkpoint; re-applied after scheduler ops (load_state_dict / fast-forward
             # can overwrite param_groups using stale scheduler base_lrs, e.g. ~0.02 vs ~0.001).
             restored_lrs = [pg['lr'] for pg in optimizer.param_groups]
@@ -546,6 +550,8 @@ def main(args):
                 for pg, lr in zip(optimizer.param_groups, restored_lrs):
                     pg['lr'] = lr
                 _sync_epoch_scheduler_base_lrs(optimizer, epoch_scheduler)
+                for pg in optimizer.param_groups:
+                    pg['initial_lr'] = pg['lr']
     if args.eval:
         utils.replace_batchnorm(model) # Users may choose whether to merge Conv-BN layers during eval
         print(f"Evaluating model: {args.model}")
