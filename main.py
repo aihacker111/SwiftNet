@@ -574,7 +574,7 @@ def main(args):
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'epoch': epoch,
-                    'model_ema': get_state_dict(model_ema),
+                    'model_ema': get_state_dict(model_ema) if model_ema is not None else None,
                     'scaler': loss_scaler.state_dict(),
                     'args': args,
                 }, checkpoint_path)
@@ -587,7 +587,7 @@ def main(args):
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'epoch': epoch,
-                    'model_ema': get_state_dict(model_ema),
+                    'model_ema': get_state_dict(model_ema) if model_ema is not None else None,
                     'scaler': loss_scaler.state_dict(),
                     'args': args,
                 }, os.path.join(output_dir, 'checkpoint_best.pth'))

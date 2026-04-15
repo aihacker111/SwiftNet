@@ -50,7 +50,8 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=3 python \
     --freeze-last-layer-epochs 1 \
     --clip-grad 3.0 \
     --clip-mode norm \
-    --no-model-ema \
+    --model-ema \
+    --model-ema-decay 0.99996 \
     --distillation-type hard \
     --distillation-alpha 0.5 \
     --distillation-tau 1.0 \
