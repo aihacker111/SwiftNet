@@ -113,14 +113,6 @@ def get_params_groups(net, layer_decay=0.9, weight_decay=0.05):
     return list(fused.values())
 
 
-def _sync_epoch_scheduler_base_lrs(optimizer, epoch_scheduler):
-    """LinearLR/CosineAnnealingLR cache base_lrs at init; after optimizer.load_state_dict
-    they must match param_groups or step() will overwrite LRs using stale bases."""
-    for sched in getattr(epoch_scheduler, "_schedulers", ()):
-        if hasattr(sched, "base_lrs"):
-            sched.base_lrs = [g["lr"] for g in optimizer.param_groups]
-
-
 def get_args_parser():
     parser = argparse.ArgumentParser(
         'RepNeXt training and evaluation script', add_help=False)
@@ -526,32 +518,22 @@ def main(args):
         if not args.eval and 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             args.start_epoch = checkpoint['epoch'] + 1
-            # Checkpoint may omit initial_lr; AdamW would keep constructor initial_lr (~scaled peak).
-            # Anything that syncs lr from initial_lr would then show ~0.02 instead of ~0.001.
-            for pg in optimizer.param_groups:
-                pg['initial_lr'] = pg['lr']
-            # LRs from checkpoint; re-applied after scheduler ops (load_state_dict / fast-forward
-            # can overwrite param_groups using stale scheduler base_lrs, e.g. ~0.02 vs ~0.001).
-            restored_lrs = [pg['lr'] for pg in optimizer.param_groups]
             if args.model_ema:
                 utils._load_checkpoint_for_ema(
                     model_ema, checkpoint['model_ema'])
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
 
-            # Restore epoch_scheduler: load state if present, else fast-forward to match
-            # completed epochs; then force optimizer LRs back to checkpoint and sync bases.
             if epoch_scheduler is not None:
                 if 'epoch_scheduler' in checkpoint and checkpoint['epoch_scheduler'] is not None:
                     epoch_scheduler.load_state_dict(checkpoint['epoch_scheduler'])
                 else:
+                    saved_lrs = [pg['lr'] for pg in optimizer.param_groups]
+                    print(saved_lrs)
                     for _ in range(args.start_epoch):
                         epoch_scheduler.step()
-                for pg, lr in zip(optimizer.param_groups, restored_lrs):
-                    pg['lr'] = lr
-                _sync_epoch_scheduler_base_lrs(optimizer, epoch_scheduler)
-                for pg in optimizer.param_groups:
-                    pg['initial_lr'] = pg['lr']
+                    for pg, lr in zip(optimizer.param_groups, saved_lrs):
+                        pg['lr'] = lr
     if args.eval:
         utils.replace_batchnorm(model) # Users may choose whether to merge Conv-BN layers during eval
         print(f"Evaluating model: {args.model}")
