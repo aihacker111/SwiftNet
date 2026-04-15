@@ -457,6 +457,7 @@ def main(args):
             freeze_iters=freeze_ll_steps,
         )
         epoch_scheduler = None
+        epoch_scheduler = None
         print(f"Scheduler: cosine_iter  warmup={warmup_steps}steps  "
               f"peak={lr_peak:.2e}  min={lr_min:.2e}")
 
@@ -522,6 +523,18 @@ def main(args):
                     model_ema, checkpoint['model_ema'])
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
+
+            # Restore epoch_scheduler: load state if present, else fast-forward to match
+            # completed epochs (optimizer LR from checkpoint is preserved).
+            if epoch_scheduler is not None:
+                if 'epoch_scheduler' in checkpoint and checkpoint['epoch_scheduler'] is not None:
+                    epoch_scheduler.load_state_dict(checkpoint['epoch_scheduler'])
+                else:
+                    saved_lrs = [pg['lr'] for pg in optimizer.param_groups]
+                    for _ in range(args.start_epoch):
+                        epoch_scheduler.step()
+                    for pg, lr in zip(optimizer.param_groups, saved_lrs):
+                        pg['lr'] = lr
     if args.eval:
         utils.replace_batchnorm(model) # Users may choose whether to merge Conv-BN layers during eval
         print(f"Evaluating model: {args.model}")
@@ -573,6 +586,7 @@ def main(args):
                     'model_ema': get_state_dict(model_ema) if model_ema is not None else None,
                     'scaler': loss_scaler.state_dict(),
                     'args': args,
+                    'epoch_scheduler': epoch_scheduler.state_dict() if epoch_scheduler is not None else None,
                 }, checkpoint_path)
             remove_epoch = epoch - 3
             if remove_epoch >= 0 and utils.is_main_process():
@@ -586,6 +600,7 @@ def main(args):
                     'model_ema': get_state_dict(model_ema) if model_ema is not None else None,
                     'scaler': loss_scaler.state_dict(),
                     'args': args,
+                    'epoch_scheduler': epoch_scheduler.state_dict() if epoch_scheduler is not None else None,
                 }, os.path.join(output_dir, 'checkpoint_best.pth'))
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         
