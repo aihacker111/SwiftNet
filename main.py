@@ -12,7 +12,7 @@ from pathlib import Path
 from timm.data import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
-from timm.scheduler import create_scheduler
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
@@ -317,7 +317,22 @@ def main(args):
     optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
 
-    lr_scheduler, _ = create_scheduler(args, optimizer)
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=args.warmup_lr / args.lr,
+        end_factor=1.0,
+        total_iters=args.warmup_epochs,
+    )
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs - args.warmup_epochs,
+        eta_min=args.min_lr,
+    )
+    lr_scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[args.warmup_epochs],
+    )
 
     criterion = LabelSmoothingCrossEntropy()
 
@@ -407,7 +422,7 @@ def main(args):
             set_bn_eval=args.set_bn_eval, # set bn to eval if finetune
         )
 
-        lr_scheduler.step(epoch)
+        lr_scheduler.step()
 
         test_stats = evaluate(data_loader_val, model, device)
         print(

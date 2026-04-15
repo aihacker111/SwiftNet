@@ -34,11 +34,9 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1 torchrun \
     --min-lr 1e-6 \
     --warmup-lr 1e-5 \
     --warmup-epochs 5 \
-    --decay-epochs 100 \
     --weight-decay 0.025 \
-    --sched cosine \
     --smoothing 0.1 \
-    --aa rand-m1-mstd0.5-inc1 \
+    --aa rand-m9-mstd0.5-inc1 \
     --color-jitter 0.0 \
     --train-interpolation random \
     --mixup 0.8 \
@@ -50,14 +48,16 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1 torchrun \
     --remode pixel \
     --recount 1 \
     --no-repeated-aug \
-    --clip-grad 1e9 \
-    --clip-mode norm \
+    --clip-grad 0.02 \
+    --clip-mode agc \
     --no-model-ema \
     --distillation-type hard \
     --distillation-alpha 0.5 \
     --distillation-tau 1.0 \
     --teacher-model regnety_160 \
     --teacher-path https://dl.fbaipublicfiles.com/deit/regnety_160-a5fe301d.pth \
+    --dist-eval \
+    --project swift_net_tiny \
     --output_dir checkpoints \
     --num_workers 16 \
     --seed 42 \
