@@ -22,10 +22,12 @@
 
 # --nproc_per_node=1 \
 # --master_port 12346 \
-NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=3 python \
+NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1 torchrun \
+    --nproc_per_node=2 \
+    --master_port 12346 \
     main.py \
     --model swift_net_tiny \
-    --data-path /kaggle/input/datasets/mayurmadnani/imagenet-dataset \
+    --data-path /workspace/imagenet \
     --batch-size 256 \
     --epochs 300 \
     --lr 0.003 \
