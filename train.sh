@@ -28,14 +28,17 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=3 python \
     --data-path /kaggle/input/datasets/mayurmadnani/imagenet-dataset \
     --batch-size 256 \
     --epochs 300 \
-    --lr 1e-3 \
-    --lr-scaling none \
+    --lr 0.003 \
     --min-lr 1e-6 \
+    --warmup-lr 1e-5 \
     --warmup-epochs 5 \
+    --decay-epochs 100 \
     --weight-decay 0.025 \
+    --sched cosine \
     --smoothing 0.1 \
     --aa rand-m1-mstd0.5-inc1 \
     --color-jitter 0.0 \
+    --train-interpolation random \
     --mixup 0.8 \
     --cutmix 0.2 \
     --mixup-prob 1.0 \
@@ -44,18 +47,16 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=3 python \
     --reprob 0.25 \
     --remode pixel \
     --recount 1 \
-    --layer-decay 0.9 \
-    --freeze-last-layer-epochs 1 \
-    --clip-grad 3.0 \
+    --no-repeated-aug \
+    --clip-grad 1e9 \
     --clip-mode norm \
-    --model-ema \
-    --model-ema-decay 0.99996 \
+    --no-model-ema \
     --distillation-type hard \
     --distillation-alpha 0.5 \
     --distillation-tau 1.0 \
     --teacher-model regnety_160 \
     --teacher-path https://dl.fbaipublicfiles.com/deit/regnety_160-a5fe301d.pth \
     --output_dir checkpoints \
-    --dist-eval \
-    --num_workers 4 \
-    --no_wandb
+    --num_workers 16 \
+    --seed 42 \
+    --input-size 224

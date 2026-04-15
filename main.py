@@ -2,115 +2,28 @@ import argparse
 import datetime
 import numpy as np
 import time
-import math
 import torch
 import torch.backends.cudnn as cudnn
 import json
 import os
-from collections import defaultdict
+
 from pathlib import Path
-from typing import List
 
 from timm.data import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from timm.scheduler import create_scheduler
+from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from data.samplers import RASampler
 from data.datasets import build_dataset
 from data.threeaugment import new_data_aug_generator
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
 
 import model
 import utils
-
-
-# ---------------------------------------------------------------------------
-# DINOv3 LR/WD schedule  (dinov3/dinov3/train/cosine_lr_scheduler.py)
-# ---------------------------------------------------------------------------
-
-class CosineScheduler:
-    """
-    Precomputed schedule: freeze → linear warmup → cosine decay.
-    Indexed per step: scheduler[it].
-    """
-    def __init__(self, base_value, final_value, total_iters,
-                 warmup_iters=0, start_warmup_value=0.0, freeze_iters=0):
-        self.final_value = final_value
-        self.total_iters = total_iters
-
-        freeze   = np.zeros(freeze_iters)
-        warmup   = np.linspace(start_warmup_value, base_value, warmup_iters)
-        iters    = np.arange(total_iters - warmup_iters - freeze_iters)
-        cosine   = (final_value
-                    + 0.5 * (base_value - final_value)
-                    * (1 + np.cos(np.pi * iters / len(iters))))
-        self.schedule = np.concatenate([freeze, warmup, cosine]).astype(np.float64)
-        assert len(self.schedule) == total_iters
-
-    def __getitem__(self, it):
-        return float(self.schedule[it] if it < self.total_iters else self.final_value)
-
-
-# ---------------------------------------------------------------------------
-# DINOv3 param groups with LLRD  (dinov3/dinov3/train/param_groups.py)
-# ---------------------------------------------------------------------------
-
-def _get_swiftnet_layer_id(name: str, num_blocks: int, stage_offsets: List[int]) -> int:
-    """
-    patch_embed            → 0          (lowest LR)
-    stages.S.B.*           → offset[S] + B + 1
-    head / norm / mergers  → num_blocks + 1  (highest LR)
-    """
-    if "patch_embed" in name:
-        return 0
-    if "stages." in name:
-        parts = name.split(".")
-        try:
-            si = parts.index("stages")
-            stage_idx = int(parts[si + 1])
-            block_idx = int(parts[si + 2])
-            return stage_offsets[stage_idx] + block_idx + 1
-        except (ValueError, IndexError):
-            pass
-    return num_blocks + 1
-
-
-def get_params_groups(net, layer_decay=0.9, weight_decay=0.05):
-    stages = getattr(net, "stages", None)
-    stage_depths  = [len(s) for s in stages] if stages else []
-    num_blocks    = sum(stage_depths)
-    stage_offsets = []
-    running = 0
-    for d in stage_depths:
-        stage_offsets.append(running)
-        running += d
-
-    all_params = []
-    for name, param in net.named_parameters():
-        if not param.requires_grad:
-            continue
-        layer_id = _get_swiftnet_layer_id(name, num_blocks, stage_offsets)
-        lr_mult  = layer_decay ** (num_blocks + 1 - layer_id)
-        no_wd    = (param.ndim == 1 or "norm" in name or "gamma" in name
-                    or name.endswith(("bias", "ls1", "ls2")))
-        wd_mult  = 0.0 if no_wd else 1.0
-        all_params.append({
-            "name": name, "params": param,
-            "lr_multiplier": lr_mult, "wd_multiplier": wd_mult,
-            "is_last_layer": "last_layer" in name,
-        })
-
-    fused = defaultdict(lambda: {"params": []})
-    for d in all_params:
-        key = f"lr{d['lr_multiplier']:.6f}_wd{d['wd_multiplier']}_ll{d['is_last_layer']}"
-        fused[key]["params"].append(d["params"])
-        fused[key].update({k: d[k] for k in ("lr_multiplier", "wd_multiplier", "is_last_layer")})
-        fused[key].setdefault("lr", 0.0)
-        fused[key].setdefault("weight_decay", 0.0)
-    return list(fused.values())
 
 
 def get_args_parser():
@@ -135,35 +48,46 @@ def get_args_parser():
                         action='store_true', default=False, help='')
 
     # Optimizer parameters
-    parser.add_argument('--clip-grad', type=float, default=3.0, metavar='NORM',
-                        help='Gradient clip norm (default: 3.0)')
-    parser.add_argument('--clip-mode', type=str, default='norm',
-                        help='Gradient clipping mode (default: norm)')
-    parser.add_argument('--weight-decay', type=float, default=0.05,
-                        help='Fixed weight decay for classification (default: 0.05)')
+    parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
+                        help='Optimizer (default: "adamw"')
+    parser.add_argument('--opt-eps', default=1e-8, type=float, metavar='EPSILON',
+                        help='Optimizer Epsilon (default: 1e-8)')
+    parser.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
+                        help='Optimizer Betas (default: None, use opt default)')
+    parser.add_argument('--clip-grad', type=float, default=0.02, metavar='NORM',
+                        help='Clip gradient norm (default: None, no clipping)')
+    parser.add_argument('--clip-mode', type=str, default='agc',
+                        help='Gradient clipping mode. One of ("norm", "value", "agc")')
+    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
+                        help='SGD momentum (default: 0.9)')
+    parser.add_argument('--weight-decay', type=float, default=0.025,
+                        help='weight decay (default: 0.025)')
 
-    # LR schedule (defaults aligned with train_simple.py: AdamW + LinearLR warmup + cosine)
-    parser.add_argument('--lr', type=float, default=3e-4, metavar='LR',
-                        help='Peak/base LR after warmup (default: 3e-4, same as train_simple.py)')
-    parser.add_argument('--lr-scaling', type=str, default='none',
-                        choices=['sqrt_wrt_1024', 'linear_wrt_256', 'none'],
-                        help='LR batch-size scaling rule. "none" uses --lr directly '
-                             '(default: none). "sqrt_wrt_1024" is the DINOv3 rule for '
-                             'large-batch ImageNet runs.')
-    parser.add_argument('--min-lr', type=float, default=1e-6, metavar='LR',
-                        help='Minimum LR (eta_min) after cosine decay (default: 1e-6, train_simple.py)')
+    # Learning rate schedule parameters
+    parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
+                        help='LR scheduler (default: "cosine"')
+    parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
+                        help='learning rate (default: 1e-3)')
+    parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
+                        help='learning rate noise on/off epoch percentages')
+    parser.add_argument('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT',
+                        help='learning rate noise limit percent (default: 0.67)')
+    parser.add_argument('--lr-noise-std', type=float, default=1.0, metavar='STDDEV',
+                        help='learning rate noise std-dev (default: 1.0)')
+    parser.add_argument('--warmup-lr', type=float, default=1e-6, metavar='LR',
+                        help='warmup learning rate (default: 1e-6)')
+    parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
+    parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
+                        help='epoch interval to decay LR')
     parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
-                        help='Linear LR warmup epochs, 0.01×peak → peak (default: 5, train_simple.py)')
-    parser.add_argument('--scheduler', type=str, default='cosine_epoch',
-                        choices=['cosine_epoch', 'cosine_iter'],
-                        help='"cosine_epoch": LinearLR warmup + CosineAnnealingLR per epoch '
-                             '(same family as train_simple.py, default). '
-                             '"cosine_iter": per-iteration cosine (DINOv3-style).')
-    parser.add_argument('--freeze-last-layer-epochs', type=int, default=1,
-                        help='Freeze last layer LR for N epochs (default: 1)')
-    parser.add_argument('--layer-decay', type=float, default=1.0,
-                        help='LLRD factor per layer (1.0 = disabled; recommended for '
-                             'from-scratch training, default: 1.0)')
+                        help='epochs to warmup LR, if scheduler supports')
+    parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
+                        help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
+    parser.add_argument('--patience-epochs', type=int, default=10, metavar='N',
+                        help='patience epochs for Plateau LR scheduler (default: 10')
+    parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
+                        help='LR decay rate (default: 0.1)')
 
     # Augmentation parameters
     parser.add_argument('--ThreeAugment', action='store_true')
@@ -172,8 +96,8 @@ def get_args_parser():
     parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
                         help='Use AutoAugment policy. "v0" or "original". " + \
                              "(default: rand-m9-mstd0.5-inc1)'),
-    parser.add_argument('--smoothing', type=float, default=0.05,
-                        help='Label smoothing (default: 0.05)')
+    parser.add_argument('--smoothing', type=float, default=0.1,
+                        help='Label smoothing (default: 0.1)')
     parser.add_argument('--train-interpolation', type=str, default='bicubic',
                         help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
     parser.add_argument('--repeated-aug', action='store_true')
@@ -258,11 +182,8 @@ def get_args_parser():
     parser.add_argument('--save_freq', default=1, type=int,
                         help='frequency of model saving')
     
-    parser.add_argument('--no-amp', action='store_true', default=False,
-                        help='Disable automatic mixed precision (fp32 training)')
     parser.add_argument('--deploy', action='store_true', default=False)
     parser.add_argument('--project', default='repnext', type=str)
-    parser.add_argument('--no_wandb', action='store_true', default=False)
     return parser
 
 import wandb
@@ -271,7 +192,7 @@ def main(args):
     
     utils.init_distributed_mode(args)
 
-    if utils.is_main_process() and not args.eval and not args.no_wandb:
+    if utils.is_main_process() and not args.eval:
         wandb.init(project=args.project, config=args)
         wandb.run.log_code('model')
     if args.distillation_type != 'none' and args.finetune and not args.eval:
@@ -385,81 +306,18 @@ def main(args):
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu], find_unused_parameters=True)
+            model, device_ids=[args.gpu])
         model_without_ddp = model.module
     n_parameters = sum(p.numel()
                        for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
-    # ── Optimizer & schedules ─────────────────────────────────────────────
-    total_bs = args.batch_size * utils.get_world_size()
-    if args.lr_scaling == 'sqrt_wrt_1024':
-        lr_peak = args.lr     * 4 * math.sqrt(total_bs / 1024.0)
-        lr_min  = args.min_lr * 4 * math.sqrt(total_bs / 1024.0)
-        print(f"LR scaling (sqrt_wrt_1024): {args.lr:.2e} → peak={lr_peak:.2e}, min={lr_min:.2e}")
-    elif args.lr_scaling == 'linear_wrt_256':
-        lr_peak = args.lr     * total_bs / 256.0
-        lr_min  = args.min_lr * total_bs / 256.0
-        print(f"LR scaling (linear_wrt_256): {args.lr:.2e} → peak={lr_peak:.2e}, min={lr_min:.2e}")
-    else:
-        lr_peak = args.lr
-        lr_min  = args.min_lr
-        print(f"LR (no scaling): peak={lr_peak:.2e}, min={lr_min:.2e}")
-
-    steps_per_epoch = len(data_loader_train)
-    total_steps     = steps_per_epoch * args.epochs
-    warmup_steps    = steps_per_epoch * args.warmup_epochs
-    freeze_ll_steps = steps_per_epoch * args.freeze_last_layer_epochs
-
-    # Optimizer must exist before epoch-based SequentialLR (train_simple.py pattern).
-    param_groups = get_params_groups(
-        model_without_ddp,
-        layer_decay=args.layer_decay,
-        weight_decay=args.weight_decay,
-    )
-    for pg in param_groups:
-        pg['lr'] = lr_peak * pg['lr_multiplier']
-
-    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999))
+    linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
+    args.lr = linear_scaled_lr
+    optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
-    lr_scheduler = None  # per-step scheduling only when --scheduler cosine_iter
 
-    if args.scheduler == 'cosine_epoch':
-        # train_simple.py: LinearLR(1e-2→1.0 over warmup_epochs) + CosineAnnealingLR(T_max=epochs-warmup, eta_min=min_lr)
-        cosine_epochs = args.epochs - args.warmup_epochs
-        lr_schedule   = None   # engine.train_one_epoch: no per-step LR update
-        wd_schedule   = None
-        last_layer_lr_schedule = None
-        epoch_scheduler = SequentialLR(
-            optimizer,
-            schedulers=[
-                LinearLR(optimizer, start_factor=1e-2, end_factor=1.0,
-                         total_iters=args.warmup_epochs),
-                CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=lr_min),
-            ],
-            milestones=[args.warmup_epochs],
-        )
-        print(f"Scheduler: cosine_epoch (train_simple-style)  warmup={args.warmup_epochs}ep  "
-              f"cosine={cosine_epochs}ep  peak={lr_peak:.2e}  min={lr_min:.2e}")
-    else:
-        # Per-iteration DINOv3-style (use for ImageNet-scale long runs)
-        lr_schedule = CosineScheduler(
-            base_value=lr_peak, final_value=lr_min,
-            total_iters=total_steps, warmup_iters=warmup_steps,
-        )
-        wd_schedule = CosineScheduler(
-            base_value=args.weight_decay, final_value=args.weight_decay,
-            total_iters=total_steps,
-        )
-        last_layer_lr_schedule = CosineScheduler(
-            base_value=lr_peak, final_value=lr_min,
-            total_iters=total_steps, warmup_iters=warmup_steps,
-            freeze_iters=freeze_ll_steps,
-        )
-        epoch_scheduler = None
-        epoch_scheduler = None
-        print(f"Scheduler: cosine_iter  warmup={warmup_steps}steps  "
-              f"peak={lr_peak:.2e}  min={lr_min:.2e}")
+    lr_scheduler, _ = create_scheduler(args, optimizer)
 
     criterion = LabelSmoothingCrossEntropy()
 
@@ -515,23 +373,15 @@ def main(args):
             checkpoint = torch.load(args.resume, map_location='cpu')
         msg = model_without_ddp.load_state_dict(checkpoint['model'], strict=True)
         print(msg)
-        if not args.eval and 'optimizer' in checkpoint and 'epoch' in checkpoint:
+        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
+            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
             if args.model_ema:
                 utils._load_checkpoint_for_ema(
                     model_ema, checkpoint['model_ema'])
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
-
-            if epoch_scheduler is not None:
-                # Luôn force fallback để scheduler được rebuild đúng (tránh load state bị lệch)
-                print(f"[Fix LR] Forcing scheduler step {args.start_epoch} times to restore correct LR at epoch {args.start_epoch}")
-                saved_lrs = [pg['lr'] for pg in optimizer.param_groups]
-                for _ in range(args.start_epoch):
-                    epoch_scheduler.step()
-                for pg, lr in zip(optimizer.param_groups, saved_lrs):
-                    pg['lr'] = lr
     if args.eval:
         utils.replace_batchnorm(model) # Users may choose whether to merge Conv-BN layers during eval
         print(f"Evaluating model: {args.model}")
@@ -548,24 +398,16 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        step_offset = (epoch - args.start_epoch) * steps_per_epoch
         train_stats = train_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, args.clip_mode, model_ema, mixup_fn,
+            # set_training_mode=args.finetune == ''  # keep in eval mode during finetuning
             set_training_mode=True,
-            set_bn_eval=args.set_bn_eval,
-            # Pass None when using epoch-based scheduler (no per-step LR updates)
-            lr_schedule=lr_schedule,
-            wd_schedule=wd_schedule,
-            last_layer_lr_schedule=last_layer_lr_schedule,
-            step_offset=step_offset,
-            amp=not args.no_amp,
+            set_bn_eval=args.set_bn_eval, # set bn to eval if finetune
         )
 
-        # Epoch-based scheduler step (only active when --scheduler cosine_epoch)
-        if epoch_scheduler is not None:
-            epoch_scheduler.step()
+        lr_scheduler.step(epoch)
 
         test_stats = evaluate(data_loader_val, model, device)
         print(
@@ -579,11 +421,11 @@ def main(args):
                 utils.save_on_master({
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
-                    'model_ema': get_state_dict(model_ema) if model_ema is not None else None,
+                    'model_ema': get_state_dict(model_ema),
                     'scaler': loss_scaler.state_dict(),
                     'args': args,
-                    'epoch_scheduler': epoch_scheduler.state_dict() if epoch_scheduler is not None else None,
                 }, checkpoint_path)
             remove_epoch = epoch - 3
             if remove_epoch >= 0 and utils.is_main_process():
@@ -593,11 +435,11 @@ def main(args):
             utils.save_on_master({
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
-                    'model_ema': get_state_dict(model_ema) if model_ema is not None else None,
+                    'model_ema': get_state_dict(model_ema),
                     'scaler': loss_scaler.state_dict(),
                     'args': args,
-                    'epoch_scheduler': epoch_scheduler.state_dict() if epoch_scheduler is not None else None,
                 }, os.path.join(output_dir, 'checkpoint_best.pth'))
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         
@@ -607,7 +449,7 @@ def main(args):
                         **{f'test_{k}': v for k, v in test_stats.items()},
                         'epoch': epoch,
                         'n_parameters': n_parameters}
-        if utils.is_main_process() and not args.no_wandb:
+        if utils.is_main_process():
             wandb.log({**{f'train_{k}': v for k, v in train_stats.items()},
                     **{f'test_{k}': v for k, v in test_stats.items()},
                     'epoch': epoch,
@@ -619,7 +461,7 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-    if utils.is_main_process() and not args.no_wandb:
+    if utils.is_main_process():
         wandb.finish()
 
 def export_onnx(model, output_dir):
