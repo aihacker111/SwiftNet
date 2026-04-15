@@ -11,7 +11,6 @@
 #     --warmup-epochs 10 \
 #     --weight-decay 0.05 \
 #     --layer-decay 0.9 \
-#     --patch-embed-lr-mult 0.2 \
 #     --freeze-last-layer-epochs 1 \
 #     --clip-grad 3.0 \
 #     --clip-mode norm \
@@ -29,7 +28,7 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=3 python \
     --data-path /kaggle/input/datasets/mayurmadnani/imagenet-dataset \
     --batch-size 256 \
     --epochs 300 \
-    --lr 4e-4 \
+    --lr 1e-3 \
     --lr-scaling none \
     --min-lr 1e-6 \
     --warmup-epochs 5 \
@@ -46,7 +45,6 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=3 python \
     --remode pixel \
     --recount 1 \
     --layer-decay 0.9 \
-    --patch-embed-lr-mult 0.2 \
     --freeze-last-layer-epochs 1 \
     --clip-grad 3.0 \
     --clip-mode norm \

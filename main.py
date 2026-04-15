@@ -78,7 +78,7 @@ def _get_swiftnet_layer_id(name: str, num_blocks: int, stage_offsets: List[int])
     return num_blocks + 1
 
 
-def get_params_groups(net, layer_decay=0.9, patch_embed_lr_mult=0.2, weight_decay=0.05):
+def get_params_groups(net, layer_decay=0.9, weight_decay=0.05):
     stages = getattr(net, "stages", None)
     stage_depths  = [len(s) for s in stages] if stages else []
     num_blocks    = sum(stage_depths)
@@ -97,8 +97,6 @@ def get_params_groups(net, layer_decay=0.9, patch_embed_lr_mult=0.2, weight_deca
         no_wd    = (param.ndim == 1 or "norm" in name or "gamma" in name
                     or name.endswith(("bias", "ls1", "ls2")))
         wd_mult  = 0.0 if no_wd else 1.0
-        if "patch_embed" in name:
-            lr_mult *= patch_embed_lr_mult
         all_params.append({
             "name": name, "params": param,
             "lr_multiplier": lr_mult, "wd_multiplier": wd_mult,
@@ -144,32 +142,28 @@ def get_args_parser():
     parser.add_argument('--weight-decay', type=float, default=0.05,
                         help='Fixed weight decay for classification (default: 0.05)')
 
-    # LR schedule
-    parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
-                        help='Base LR (default: 1e-3)')
+    # LR schedule (defaults aligned with train_simple.py: AdamW + LinearLR warmup + cosine)
+    parser.add_argument('--lr', type=float, default=3e-4, metavar='LR',
+                        help='Peak/base LR after warmup (default: 3e-4, same as train_simple.py)')
     parser.add_argument('--lr-scaling', type=str, default='none',
                         choices=['sqrt_wrt_1024', 'linear_wrt_256', 'none'],
                         help='LR batch-size scaling rule. "none" uses --lr directly '
                              '(default: none). "sqrt_wrt_1024" is the DINOv3 rule for '
                              'large-batch ImageNet runs.')
-    parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
-                        help='Minimum LR after cosine decay (default: 1e-5)')
+    parser.add_argument('--min-lr', type=float, default=1e-6, metavar='LR',
+                        help='Minimum LR (eta_min) after cosine decay (default: 1e-6, train_simple.py)')
     parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
-                        help='Warmup epochs (default: 5)')
+                        help='Linear LR warmup epochs, 0.01×peak → peak (default: 5, train_simple.py)')
     parser.add_argument('--scheduler', type=str, default='cosine_epoch',
                         choices=['cosine_epoch', 'cosine_iter'],
-                        help='"cosine_epoch": epoch-based SequentialLR (recommended for '
-                             'from-scratch training, default). '
-                             '"cosine_iter": per-iteration precomputed cosine (DINOv3-style, '
-                             'use for large-batch ImageNet runs).')
+                        help='"cosine_epoch": LinearLR warmup + CosineAnnealingLR per epoch '
+                             '(same family as train_simple.py, default). '
+                             '"cosine_iter": per-iteration cosine (DINOv3-style).')
     parser.add_argument('--freeze-last-layer-epochs', type=int, default=1,
                         help='Freeze last layer LR for N epochs (default: 1)')
     parser.add_argument('--layer-decay', type=float, default=1.0,
                         help='LLRD factor per layer (1.0 = disabled; recommended for '
                              'from-scratch training, default: 1.0)')
-    parser.add_argument('--patch-embed-lr-mult', type=float, default=1.0,
-                        help='Extra LR multiplier for patch_embed (1.0 = no suppression, '
-                             'default: 1.0)')
 
     # Augmentation parameters
     parser.add_argument('--ThreeAugment', action='store_true')
@@ -417,11 +411,23 @@ def main(args):
     warmup_steps    = steps_per_epoch * args.warmup_epochs
     freeze_ll_steps = steps_per_epoch * args.freeze_last_layer_epochs
 
+    # Optimizer must exist before epoch-based SequentialLR (train_simple.py pattern).
+    param_groups = get_params_groups(
+        model_without_ddp,
+        layer_decay=args.layer_decay,
+        weight_decay=args.weight_decay,
+    )
+    for pg in param_groups:
+        pg['lr'] = lr_peak * pg['lr_multiplier']
+
+    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999))
+    loss_scaler = NativeScaler()
+    lr_scheduler = None  # per-step scheduling only when --scheduler cosine_iter
+
     if args.scheduler == 'cosine_epoch':
-        # Epoch-based: stable for from-scratch training on small/medium datasets.
-        # LR is constant within each epoch; cosine decays between epochs.
+        # train_simple.py: LinearLR(1e-2→1.0 over warmup_epochs) + CosineAnnealingLR(T_max=epochs-warmup, eta_min=min_lr)
         cosine_epochs = args.epochs - args.warmup_epochs
-        lr_schedule   = None   # signal to engine.train_one_epoch to skip per-step update
+        lr_schedule   = None   # engine.train_one_epoch: no per-step LR update
         wd_schedule   = None
         last_layer_lr_schedule = None
         epoch_scheduler = SequentialLR(
@@ -433,7 +439,7 @@ def main(args):
             ],
             milestones=[args.warmup_epochs],
         )
-        print(f"Scheduler: cosine_epoch  warmup={args.warmup_epochs}ep  "
+        print(f"Scheduler: cosine_epoch (train_simple-style)  warmup={args.warmup_epochs}ep  "
               f"cosine={cosine_epochs}ep  peak={lr_peak:.2e}  min={lr_min:.2e}")
     else:
         # Per-iteration DINOv3-style (use for ImageNet-scale long runs)
@@ -453,16 +459,6 @@ def main(args):
         epoch_scheduler = None
         print(f"Scheduler: cosine_iter  warmup={warmup_steps}steps  "
               f"peak={lr_peak:.2e}  min={lr_min:.2e}")
-
-    param_groups = get_params_groups(
-        model_without_ddp,
-        layer_decay=args.layer_decay,
-        patch_embed_lr_mult=args.patch_embed_lr_mult,
-        weight_decay=args.weight_decay,
-    )
-    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999))
-    loss_scaler = NativeScaler()
-    lr_scheduler = None  # scheduling done per-step inside train_one_epoch
 
     criterion = LabelSmoothingCrossEntropy()
 
