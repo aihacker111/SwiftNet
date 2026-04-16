@@ -62,5 +62,5 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1 torchrun \
     --num_workers 16 \
     --seed 42 \
     --input-size 224 \
-    --resume /workspace/checkpoints/swift_net_tiny/2026_04_15_11_48_50/checkpoint_79.pth
+    --resume /workspace/SwiftNet/checkpoints/swift_net_tiny/2026_04_15_11_48_50/checkpoint_79.pth
     # --amp-dtype bfloat16
