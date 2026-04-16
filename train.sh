@@ -28,9 +28,9 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1 torchrun \
     main.py \
     --model swift_net_tiny \
     --data-path /workspace/imagenet \
-    --batch-size 512 \
+    --batch-size 256 \
     --epochs 300 \
-    --lr 0.006 \
+    --lr 0.003 \
     --min-lr 1e-6 \
     --warmup-lr 1e-5 \
     --warmup-epochs 5 \
@@ -59,7 +59,7 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1 torchrun \
     --dist-eval \
     --project swift_net_tiny \
     --output_dir checkpoints \
-    --num_workers 16 \
+    --num_workers 24 \
     --seed 42 \
     --input-size 224 \
     # --amp-dtype bfloat16
