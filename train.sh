@@ -30,7 +30,7 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1 torchrun \
     --data-path /workspace/imagenet \
     --batch-size 512 \
     --epochs 300 \
-    --lr 0.003 \
+    --lr 0.006 \
     --min-lr 1e-6 \
     --warmup-lr 1e-5 \
     --warmup-epochs 5 \
