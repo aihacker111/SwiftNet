@@ -33,7 +33,7 @@ NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1 torchrun \
     --lr 0.003 \
     --min-lr 1e-6 \
     --warmup-lr 1e-5 \
-    --warmup-epochs 10 \
+    --warmup-epochs 5 \
     --weight-decay 0.025 \
     --smoothing 0.1 \
     --aa rand-m9-mstd0.5-inc1 \
