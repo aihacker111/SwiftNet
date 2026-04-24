@@ -377,6 +377,24 @@ def main(args):
         with (output_dir / "args.txt").open("a") as f:
             f.write(json.dumps(args.__dict__, indent=2) + "\n")
             print(json.dumps(args.__dict__, indent=2) + "\n")
+    # if args.resume:
+    #     if args.resume.startswith('https'):
+    #         checkpoint = torch.hub.load_state_dict_from_url(
+    #             args.resume, map_location='cpu', check_hash=True)
+    #     else:
+    #         print("Loading local checkpoint at {}".format(args.resume))
+    #         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+    #     msg = model_without_ddp.load_state_dict(checkpoint['model'], strict=True)
+    #     print(msg)
+    #     if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+    #         optimizer.load_state_dict(checkpoint['optimizer'])
+    #         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+    #         args.start_epoch = checkpoint['epoch'] + 1
+    #         if args.model_ema:
+    #             utils._load_checkpoint_for_ema(
+    #                 model_ema, checkpoint['model_ema'])
+    #         if 'scaler' in checkpoint:
+    #             loss_scaler.load_state_dict(checkpoint['scaler'])
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -386,10 +404,28 @@ def main(args):
             checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         msg = model_without_ddp.load_state_dict(checkpoint['model'], strict=True)
         print(msg)
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+        if not args.eval and 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
+
+            # ── FIX: không dùng checkpoint['lr_scheduler'] vì nó bị corrupt
+            # khi resume trên GPU/batch config khác (SequentialLR last_epoch lệch).
+            # Fast-forward scheduler mới tới start_epoch để LR đúng schedule.
+            import warnings
+            for _ in range(args.start_epoch):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    lr_scheduler.step()
+            print(f"LR after fast-forward to epoch {args.start_epoch}: "
+                  f"{optimizer.param_groups[0]['lr']:.6e}")
+
+            # ── log_tau clamp: ngăn cosine attention temperature diverge
+            # (nguyên nhân phụ khiến train loss tăng sau khi BN drift bắt đầu)
+            # with torch.no_grad():
+            #     for m in model_without_ddp.modules():
+            #         if hasattr(m, 'log_tau'):
+            #             m.log_tau.clamp_(-4.0, 4.0)
+
             if args.model_ema:
                 utils._load_checkpoint_for_ema(
                     model_ema, checkpoint['model_ema'])
