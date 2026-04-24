@@ -189,7 +189,6 @@ def get_args_parser():
 import wandb
 
 def main(args):
-    
     utils.init_distributed_mode(args)
 
     if utils.is_main_process() and not args.eval:
@@ -245,7 +244,7 @@ def main(args):
 
     if args.ThreeAugment:
         data_loader_train.dataset.transform = new_data_aug_generator(args)
-        
+
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
         batch_size=int(1.5 * args.batch_size),
@@ -496,4 +495,5 @@ if __name__ == '__main__':
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     else:
         assert(False)
+
     main(args)
