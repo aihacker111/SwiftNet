@@ -26,7 +26,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
     --nproc_per_node=4 \
     --master_port 12346 \
     main.py \
-    --model swift_net_tiny \
+    --model swift_net_base \
     --data-path /workspace/imagenet \
     --batch-size 256 \
     --epochs 300 \
