@@ -30,7 +30,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
     --data-path /workspace/imagenet \
     --batch-size 256 \
     --epochs 300 \
-    --lr 0.002 \
+    --lr 0.003 \
     --min-lr 1e-6 \
     --warmup-lr 1e-5 \
     --warmup-epochs 5 \
@@ -57,7 +57,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
     --teacher-model regnety_160 \
     --teacher-path https://dl.fbaipublicfiles.com/deit/regnety_160-a5fe301d.pth \
     --dist-eval \
-    --project swift_net_tiny \
+    --project swift_net_base \
     --output_dir checkpoints \
     --num_workers 16 \
     --seed 42 \
