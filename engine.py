@@ -80,7 +80,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         loss_scaler(loss, optimizer, clip_grad=clip_grad, clip_mode=clip_mode,
                     parameters=model.parameters(), create_graph=is_second_order)
 
-        torch.cuda.synchronize()
         if model_ema is not None:
             model_ema.update(model)
 

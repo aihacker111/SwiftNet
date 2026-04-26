@@ -39,7 +39,7 @@ class RopePositionEmbedding(nn.Module):
         self._cache_cos: Tensor | None = None
 
     def forward(self, *, H: int, W: int) -> tuple[Tensor, Tensor]:
-        if not self.training and self._cache_key == (H, W):
+        if self._cache_key == (H, W):
             return self._cache_sin, self._cache_cos  # type: ignore[return-value]
 
         device = self.periods.device
@@ -68,10 +68,9 @@ class RopePositionEmbedding(nn.Module):
         sin = torch.sin(angles)
         cos = torch.cos(angles)
 
-        if not self.training:
-            self._cache_key = (H, W)
-            self._cache_sin = sin
-            self._cache_cos = cos
+        self._cache_key = (H, W)
+        self._cache_sin = sin
+        self._cache_cos = cos
 
         return sin, cos
 
