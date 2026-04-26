@@ -348,9 +348,9 @@ def swift_net_base(pretrained: bool = False, **kwargs) -> SWIFTNet:
     """~30M params — high accuracy, server-class edge."""
     args = dict(
         dims=[64, 128, 256, 512],
-        depths=[2, 2, 8, 2],
+        depths=[2, 2, 8, 3],
         num_heads=[2, 4, 8, 16],
-        drop_path_rate=0.2,
+        drop_path_rate=0.25,
     )
     return _create("swift_net_base", pretrained, **{**args, **kwargs})
 
